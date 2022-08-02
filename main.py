@@ -1,16 +1,15 @@
-# This is a sample Python script.
+from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+import os
+import django
 
+api_key=os.environ['BINANCE_APIKEY']
+api_secret=os.environ['BINANCE_SECRETKEY']
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+client = Client(api_key, api_secret)
 
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+# print(client.futures_account_balance())
+# print(client.get_account())
+# print(client.get_margin_account())
+# print(client.futures_account())
+print(client.order)
