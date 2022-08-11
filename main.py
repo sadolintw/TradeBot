@@ -1,4 +1,5 @@
 from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
+import json
 
 import os
 import django
@@ -32,4 +33,15 @@ client = Client(api_key, api_secret)
 # print(
 #     client.futures_order_book(symbol='ETHUSDT')
 # )
-print(client.futures_get_open_orders(symbol='ETHUSDT'))
+# print(client.futures_get_open_orders(symbol='ETHUSDT'))
+# print(client.futures_account_balance())
+
+positions = client.futures_account()['positions']
+target = None
+for position in positions:
+    if position['symbol'] == 'ETHUSDT':
+        target = position
+        break
+print(float(position['initialMargin']) > 0)
+
+# print(json.dumps(client.futures_account()['positions']))

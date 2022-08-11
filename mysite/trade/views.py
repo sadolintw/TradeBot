@@ -16,6 +16,7 @@ tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
 
+
 @api_view(['GET', 'POST'])
 def webhook(request):
     body_unicode = request.body.decode('utf-8')
@@ -35,8 +36,10 @@ def webhook(request):
                 short_times = signal['strategy']['short']['times']
                 short_stop_loss = signal['strategy']['short']['stopLoss']
                 short_take_profit = signal['strategy']['short']['takeProfit']
-                quantity = round(float(withdrawAvailableUSDT)*0.98/float(entry), 2) * int(long_times if side=='BUY' else short_times)
-                create_order(ticker, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit)
+                quantity = round(float(withdrawAvailableUSDT) * 0.98 / float(entry), 2) * int(
+                    long_times if side == 'BUY' else short_times)
+                create_order(ticker, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss,
+                             short_take_profit)
         except:
             print("error:", sys.exc_info())
     else:
@@ -55,14 +58,17 @@ def get_usdt():
     print('withdrawAvailableUSDT', withdrawAvailableUSDT)
     return withdrawAvailableUSDT
 
+
 def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit):
     print(symbol, side, quantity, entry)
 
     stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
-    stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (float(entry) * (100 + float(short_stop_loss)) / 100), 2)
+    stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (
+                float(entry) * (100 + float(short_stop_loss)) / 100), 2)
 
     take_profit_side = 'SELL' if side == 'BUY' else 'BUY'
-    take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (float(entry) * (100 - float(short_take_profit)) / 100), 2)
+    take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (
+                float(entry) * (100 - float(short_take_profit)) / 100), 2)
 
     batch_payload = [
         {
@@ -114,3 +120,14 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
     # )
     response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
     print(response)
+
+
+def check_position(symbol):
+    positions = client.futures_account()['positions']
+    target = None
+    for position in positions:
+        if position['symbol'] == symbol:
+            target = position
+            print(float(position['initialMargin']) > 0)
+            return True
+    return False
