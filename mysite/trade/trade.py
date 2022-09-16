@@ -1,15 +1,15 @@
 from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
 import json
 import os
+import sys
 
 api_key = os.environ['BINANCE_APIKEY']
 api_secret = os.environ['BINANCE_SECRETKEY']
-
 client = Client(api_key, api_secret)
-import sys
+
+pass_order = False
 
 def get_usdt():
-    print('test')
     balances = client.futures_account_balance()
     withdrawAvailableUSDT = 0
     for balance in balances:
@@ -18,14 +18,17 @@ def get_usdt():
     print('withdrawAvailableUSDT', withdrawAvailableUSDT)
     return withdrawAvailableUSDT
 
+
 def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit):
     print(symbol, side, quantity, entry)
 
     stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
-    stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (float(entry) * (100 + float(short_stop_loss)) / 100), 2)
+    stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (
+            float(entry) * (100 + float(short_stop_loss)) / 100), 2)
 
     take_profit_side = 'SELL' if side == 'BUY' else 'BUY'
-    take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (float(entry) * (100 - float(short_take_profit)) / 100), 2)
+    take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (
+            float(entry) * (100 - float(short_take_profit)) / 100), 2)
 
     batch_payload = [
         {
@@ -35,7 +38,7 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
             'quantity': str(quantity),
             'side': side,
             'timeInForce': 'GTC',
-            'price': entry
+            'price': str(entry)
         },
         {
             # 'newClientOrderId': '6925e0cb-2d86-42af-875c-877da7b5fda5',
@@ -75,5 +78,32 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
     #     timeInForce='GTC',
     #     price=entry
     # )
-    response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+    if pass_order:
+        response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+        print(response)
+    else:
+        print('stop place order')
+
+
+def check_position(symbol):
+    positions = client.futures_account()['positions']
+    target = None
+    for position in positions:
+        if position['symbol'] == symbol:
+            target = position
+            print('has initial margin', float(position['initialMargin']) > 0)
+            print('leverage', position['leverage'])
+            return True
+    return False
+
+
+def close_position(symbol, side, stop_price):
+    response = client.futures_create_order(
+        symbol=symbol,
+        # side='SELL' if side == 'BUY' else 'BUY',
+        side=side,
+        type='TAKE_PROFIT_MARKET',
+        closePosition='True',
+        stopPrice=stop_price
+    )
     print(response)

@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 import os
 from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
@@ -21,12 +22,15 @@ def index(request):
 def webhook(request):
     body_unicode = request.body.decode('utf-8')
     print('received signal: ', body_unicode)
+    precision = 2
+    percentage = 0.95
+    # percentage = 0.1
     if body_unicode:
         try:
             signal = json.loads(body_unicode)
             if signal['passphase'] == tradingview_passphase:
                 withdrawAvailableUSDT = get_usdt()
-                entry = signal['entry']
+                entry = round(float(signal['entry']), precision)
                 ticker = signal['ticker']
                 # side = signal['order'] == 'sell' ? 'SELL' : 'BUY'
                 side = 'SELL' if signal['order'] == 'sell' else 'BUY'
@@ -36,10 +40,23 @@ def webhook(request):
                 short_times = signal['strategy']['short']['times']
                 short_stop_loss = signal['strategy']['short']['stopLoss']
                 short_take_profit = signal['strategy']['short']['takeProfit']
-                quantity = round(float(withdrawAvailableUSDT) * 0.98 / float(entry), 2) * int(
-                    long_times if side == 'BUY' else short_times)
+                position_size = round(float(signal['position_size']), precision)
+                raw_quantity = math.floor(100 * float(withdrawAvailableUSDT) * percentage / entry) / 100
+                quantity = round(raw_quantity * int(long_times if side == 'BUY' else short_times), precision)
+                print('quantity', quantity)
+                has_position = check_position(symbol=ticker)
+                # TODO close position and order (stop or take profit)
+                if int(position_size) == 0:
+                    return
+
+                # handling current position
+                # if has_position or position_size==0:
+                #     print('has position', has_position, 'position size', position_size)
+                # close_position(symbol=ticker, side=side, stop_price=entry)
+
+                # create order by signal
                 create_order(ticker, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss,
-                             short_take_profit)
+                             short_take_profit, precision)
         except:
             print("error:", sys.exc_info())
     else:
@@ -49,7 +66,6 @@ def webhook(request):
 
 
 def get_usdt():
-    print('test')
     balances = client.futures_account_balance()
     withdrawAvailableUSDT = 0
     for balance in balances:
@@ -59,16 +75,16 @@ def get_usdt():
     return withdrawAvailableUSDT
 
 
-def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit):
+def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit, precision):
     print(symbol, side, quantity, entry)
 
     stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
     stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (
-                float(entry) * (100 + float(short_stop_loss)) / 100), 2)
+            float(entry) * (100 + float(short_stop_loss)) / 100), precision)
 
     take_profit_side = 'SELL' if side == 'BUY' else 'BUY'
     take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (
-                float(entry) * (100 - float(short_take_profit)) / 100), 2)
+            float(entry) * (100 - float(short_take_profit)) / 100), precision)
 
     batch_payload = [
         {
@@ -78,7 +94,7 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
             'quantity': str(quantity),
             'side': side,
             'timeInForce': 'GTC',
-            'price': entry
+            'price': str(entry)
         },
         {
             # 'newClientOrderId': '6925e0cb-2d86-42af-875c-877da7b5fda5',
@@ -87,7 +103,7 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
             'quantity': str(quantity),
             'side': stop_loss_side,
             'stopPrice': str(stop_loss_stop_price),
-            'timeInForce': 'GTE_GTC',
+            # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
         },
         {
@@ -97,7 +113,7 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
             'quantity': str(quantity),
             'side': take_profit_side,
             'stopPrice': str(take_profit_stop_price),
-            'timeInForce': 'GTE_GTC',
+            # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
         }
     ]
@@ -128,6 +144,19 @@ def check_position(symbol):
     for position in positions:
         if position['symbol'] == symbol:
             target = position
-            print(float(position['initialMargin']) > 0)
+            print('has initial margin', float(position['initialMargin']) > 0)
+            print('leverage', position['leverage'])
             return True
     return False
+
+
+def close_position(symbol, side, stop_price):
+    response = client.futures_create_order(
+        symbol=symbol,
+        # side='SELL' if side == 'BUY' else 'BUY',
+        side=side,
+        type='TAKE_PROFIT_MARKET',
+        closePosition='True',
+        stopPrice=stop_price
+    )
+    print(response)
