@@ -13,6 +13,9 @@ api_secret = os.environ['BINANCE_SECRETKEY']
 client = Client(api_key, api_secret)
 tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
 
+prev_quantity = 0
+prev_opposite_side = ''
+
 
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
@@ -23,16 +26,17 @@ def webhook(request):
     body_unicode = request.body.decode('utf-8')
     print('received signal: ', body_unicode)
     precision = 2
-    percentage = 0.95
-    # percentage = 0.1
+    # percentage = 0.95
+    percentage = 0.1
+
     if body_unicode:
         try:
             signal = json.loads(body_unicode)
             if signal['passphase'] == tradingview_passphase:
+                print('passphase correct')
                 withdrawAvailableUSDT = get_usdt()
                 entry = round(float(signal['entry']), precision)
                 ticker = signal['ticker']
-                # side = signal['order'] == 'sell' ? 'SELL' : 'BUY'
                 side = 'SELL' if signal['order'] == 'sell' else 'BUY'
                 long_times = signal['strategy']['long']['times']
                 long_stop_loss = signal['strategy']['long']['stopLoss']
@@ -43,10 +47,13 @@ def webhook(request):
                 position_size = round(float(signal['position_size']), precision)
                 raw_quantity = math.floor(100 * float(withdrawAvailableUSDT) * percentage / entry) / 100
                 quantity = round(raw_quantity * int(long_times if side == 'BUY' else short_times), precision)
+                print('raw_quantity', raw_quantity)
                 print('quantity', quantity)
+                print('position_size', position_size)
                 has_position = check_position(symbol=ticker)
                 # TODO close position and order (stop or take profit)
-                if int(position_size) == 0:
+                if round(float(position_size), 3) == 0:
+                    print('end')
                     return
 
                 # handling current position
@@ -75,8 +82,65 @@ def get_usdt():
     return withdrawAvailableUSDT
 
 
-def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit, precision):
-    print(symbol, side, quantity, entry)
+def cancel_all_open_order(symbol):
+    client.futures_cancel_all_open_orders(symbol=symbol)
+
+
+def check_position(symbol):
+    print('check_position')
+    positions = client.futures_account()['positions']
+    target = None
+    for position in positions:
+        if position['symbol'] == symbol:
+            global prev_quantity
+            global prev_opposite_side
+            target = position
+            print('position', position)
+            print('has initial margin', float(position['initialMargin']) > 0)
+            print('leverage', position['leverage'])
+            prev_quantity = position['positionAmt']
+            prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else 'BUY'
+            print('quantity', prev_quantity)
+            print('opposite_side', prev_opposite_side)
+            return True
+    return False
+
+
+def close_position(symbol, side, quantity):
+    precision = 3
+    print('close_position', symbol, side, round(float(quantity), precision))
+    response = client.futures_create_order(
+        symbol=symbol,
+        type="MARKET",
+        side=side,
+        quantity=round(abs(float(quantity)), precision),
+        reduceOnly='True'
+    )
+    print(response)
+
+
+def close_position_at_price(symbol, side, stop_price):
+    response = client.futures_create_order(
+        symbol=symbol,
+        # side='SELL' if side == 'BUY' else 'BUY',
+        side=side,
+        type='TAKE_PROFIT_MARKET',
+        closePosition='True',
+        stopPrice=stop_price
+    )
+    print(response)
+
+
+def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit, short_stop_loss, short_take_profit,
+                 precision):
+    print('create_order', symbol, side, quantity, entry)
+
+    print('cancel prev open order')
+    cancel_all_open_order(symbol=symbol)
+    print('close prev position')
+    if abs(float(prev_quantity)) > 0.0:
+        print('has position')
+        close_position(symbol=symbol, side=prev_opposite_side, quantity=prev_quantity)
 
     stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
     stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (
@@ -117,7 +181,7 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
             'reduceOnly': 'True'
         }
     ]
-    print(json.dumps(batch_payload), '\r\n')
+    print('batch order', json.dumps(batch_payload), '\r\n')
     # response = client.create_test_order(
     #     symbol=symbol,
     #     side=side,
@@ -135,28 +199,4 @@ def create_order(symbol, side, quantity, entry, long_stop_loss, long_take_profit
     #     price=entry
     # )
     response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
-    print(response)
-
-
-def check_position(symbol):
-    positions = client.futures_account()['positions']
-    target = None
-    for position in positions:
-        if position['symbol'] == symbol:
-            target = position
-            print('has initial margin', float(position['initialMargin']) > 0)
-            print('leverage', position['leverage'])
-            return True
-    return False
-
-
-def close_position(symbol, side, stop_price):
-    response = client.futures_create_order(
-        symbol=symbol,
-        # side='SELL' if side == 'BUY' else 'BUY',
-        side=side,
-        type='TAKE_PROFIT_MARKET',
-        closePosition='True',
-        stopPrice=stop_price
-    )
     print(response)
