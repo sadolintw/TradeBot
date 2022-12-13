@@ -18,12 +18,14 @@ api_secret = os.environ['BINANCE_SECRETKEY']
 client = Client(api_key, api_secret)
 tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
 
+
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
 
 
 def wrap_str(_str):
     return "[" + _str + "]"
+
 
 @api_view(['GET', 'POST'])
 def webhook(request):
@@ -48,7 +50,8 @@ def webhook(request):
                 allowed_close_position = False
                 if position is not None:
                     prev_quantity = position['positionAmt']
-                    prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else ('' if float(prev_quantity) == 0.0 else 'BUY')
+                    prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
+                        '' if float(prev_quantity) == 0.0 else 'BUY')
                     prev_update_time = int(position['updateTime'])
                     now = datetime.now()
                     timestamp = datetime.timestamp(now) * 1000
@@ -59,9 +62,18 @@ def webhook(request):
                 # if signal position == 0, close position
                 # and abs(float(prev_quantity)) > 0  ?
                 if round(float(signal_position_size), 3) == 0 and allowed_close_position:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'no position size')
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'no position size, it is close signal')
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
+                    post_data = {
+                        'symbol': signal_symbol,
+                        'side': prev_opposite_side,
+                        'msg': 'close prev position'
+                    }
+                    response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
+                    content = response.content
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
                     return HttpResponse('received')
 
@@ -80,29 +92,32 @@ def webhook(request):
                 signal_short_stop_loss = signal['strategy']['short']['stopLoss']
                 signal_short_take_profit = signal['strategy']['short']['takeProfit']
                 raw_quantity = math.floor(100 * float(usdt) * percentage / signal_entry) / 100
-                quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times), precision)
+                quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
+                                 precision)
 
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'raw_quantity', raw_quantity)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', quantity)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'signal_position_size', signal_position_size)
 
-
                 # create order by signal
-                create_order(req_id, signal_symbol, signal_side, quantity, prev_quantity, prev_opposite_side, signal_entry, signal_long_stop_loss,
+                create_order(req_id, signal_symbol, signal_side, quantity, prev_quantity, prev_opposite_side,
+                             signal_entry, signal_long_stop_loss,
                              signal_long_take_profit, signal_short_stop_loss,
                              signal_short_take_profit, precision)
 
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
                 post_data = {
                     'symbol': signal_symbol,
                     'entry': signal_entry,
                     'side': signal_side,
+                    'msg': 'create order'
                 }
                 response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
                 content = response.content
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
             else:
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphase incorrect')
-                #send telegram msg
+                # send telegram msg
                 # requests.get('http://127.0.0.1:5000/telegram')
         except:
             print(req_id, wrap_str(inspect.stack()[0][3]), "error:", sys.exc_info())
@@ -138,7 +153,8 @@ def get_position(req_id, symbol):
             print(req_id, wrap_str(inspect.stack()[0][3]), 'has initial margin', float(position['initialMargin']) > 0)
             print(req_id, wrap_str(inspect.stack()[0][3]), 'leverage', position['leverage'])
             print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', position['positionAmt'])
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'opposite_side', 'SELL' if float(position['positionAmt']) > 0 else 'BUY')
+            print(req_id, wrap_str(inspect.stack()[0][3]), 'opposite_side',
+                  'SELL' if float(position['positionAmt']) > 0 else 'BUY')
             return target
     return None
 

@@ -2,7 +2,21 @@
 
 create Binance ETHUSDTPERP order by Trading View Signal
 
-# Signal
+# Prerequisite
+
+## Env var
+
+- **BINANCE_APIKEY**
+
+- **BINANCE_SECRETKEY**
+
+- **TRADINGVIEW_PASSPHASE**
+
+- **TELEGRAM_BOT_ACCESS_TOKEN**
+
+- **TELEGRAM_BOT_CHAT_ID**
+
+# Signal Format
 ```json
 {
   "entry": "{{strategy.order.price}}",
