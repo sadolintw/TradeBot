@@ -209,14 +209,23 @@ def create_order(req_id, symbol, side, quantity, prev_quantity, prev_opposite_si
             float(entry) * (100 - float(short_take_profit)) / 100), precision)
 
     batch_payload = [
+        # {
+        #     # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
+        #     'symbol': symbol,
+        #     'type': 'LIMIT',
+        #     'quantity': str(quantity),
+        #     'side': side,
+        #     'timeInForce': 'GTC',
+        #     'price': str(entry)
+        # },
         {
             # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
             'symbol': symbol,
-            'type': 'LIMIT',
+            'type': 'MARKET',
             'quantity': str(quantity),
-            'side': side,
-            'timeInForce': 'GTC',
-            'price': str(entry)
+            'side': side
+            # 'timeInForce': 'GTC',
+            # 'price': str(entry)
         },
         {
             # 'newClientOrderId': '6925e0cb-2d86-42af-875c-877da7b5fda5',
