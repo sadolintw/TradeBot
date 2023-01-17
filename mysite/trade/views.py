@@ -49,6 +49,7 @@ def webhook(request):
                 position = get_position(req_id=req_id, symbol=signal_symbol)
                 allowed_close_position = False
                 if position is not None:
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'position is not None')
                     prev_quantity = position['positionAmt']
                     prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
                         '' if float(prev_quantity) == 0.0 else 'BUY')
@@ -59,9 +60,12 @@ def webhook(request):
                     diff = (timestamp - prev_update_time) / 1000
                     allowed_close_position = True if diff > preserve_prev_position_second else False
 
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'signal_position_size', signal_position_size)
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'allowed_close_position', allowed_close_position)
+
                 # if signal position == 0, close position
                 # and abs(float(prev_quantity)) > 0  ?
-                if round(float(signal_position_size), 3) == 0 and allowed_close_position:
+                if signal_position_size == 0 and allowed_close_position:
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'no position size, it is close signal')
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)

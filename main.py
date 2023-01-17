@@ -1,4 +1,4 @@
-
+import json
 from binance import Client
 from datetime import datetime
 import os
@@ -7,6 +7,12 @@ api_key = os.environ['BINANCE_APIKEY']
 api_secret = os.environ['BINANCE_SECRETKEY']
 
 client = Client(api_key, api_secret)
+
+# change leverage
+# client.futures_change_leverage(symbol="ETHUSDT", leverage=5)
+
+# ============================================
+
 # cancel order
 # client.futures_cancel_order(symbol="ETHUSDT")
 
@@ -110,9 +116,20 @@ client = Client(api_key, api_secret)
 
 # test telegram
 from telegram.ext import *
-import telegram
-import os
-telegram_bot_access_token = os.environ['TELEGRAM_BOT_ACCESS_TOKEN']
-telegram_bot_chat_id = os.environ['TELEGRAM_BOT_CHAT_ID']
-bot = telegram.Bot(token=telegram_bot_access_token)
-bot.send_message(chat_id=telegram_bot_chat_id, text="""hi""")
+# import telegram
+# import os
+# telegram_bot_access_token = os.environ['TELEGRAM_BOT_ACCESS_TOKEN']
+# telegram_bot_chat_id = os.environ['TELEGRAM_BOT_CHAT_ID']
+# bot = telegram.Bot(token=telegram_bot_access_token)
+# bot.send_message(chat_id=telegram_bot_chat_id, text="""hi""")
+
+# signal = json.loads('{"passphase":"cd51dccb-1413-46e3-aa06-ba40a5668d9f","strategy":{"name":"My Super Trend VTest '
+#                     '1H","long":{"times":"5","stopLoss":"1.5","takeProfit":"20"},"short":{"times":"5",'
+#                     '"stopLoss":"1.5","takeProfit":"10"}},"order":"sell","unit":"3.637","ticker":"ETHUSDT",'
+#                     '"position_size":"0","entry":"1477.28"}')
+#
+# signal_position_size = round(float(signal['position_size']), 2)
+# print(signal_position_size)
+# print(signal_position_size==0)
+# print(round(float(signal_position_size), 3))
+# print(datetime.timestamp(datetime.now()) * 1000)
