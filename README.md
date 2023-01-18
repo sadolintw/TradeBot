@@ -20,16 +20,17 @@ create Binance ETHUSDTPERP order by Trading View Signal
 ```json
 {
   "entry": "{{strategy.order.price}}",
+  "message": "{{strategy.order.alert_message}}",
   "order": "{{strategy.order.action}}",
   "passphase": "<your passphase>",
   "position_size": "{{strategy.position_size}}",
   "strategy": {
     "long": {
       "stopLoss": "1.5",
-      "takeProfit": "35",
+      "takeProfit": "20",
       "times": "5"
     },
-    "name": "<your trading view strategy>",
+    "name": "<your trading view strategy name>",
     "short": {
       "stopLoss": "1.5",
       "takeProfit": "10",
@@ -39,4 +40,10 @@ create Binance ETHUSDTPERP order by Trading View Signal
   "ticker": "ETHUSDT",
   "unit": "{{strategy.order.contracts}}"
 }
+```
+
+message format:
+
+```
+{"type": "long_entry"|"long_exit"|"short_entry"|"short_exit", "lev": tostring(int_num), "sl": tostring(float_num)}
 ```

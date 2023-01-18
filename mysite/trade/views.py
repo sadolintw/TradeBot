@@ -27,7 +27,7 @@ def wrap_str(_str):
     return "[" + _str + "]"
 
 
-enable_all_api = False
+enable_all_api = True
 enable_change_leverage = True
 enable_get_usdt = True
 enable_cancel_all_open_order = True
@@ -37,8 +37,8 @@ enable_close_position_at_price = True
 enable_create_order = True
 
 
-def checkApiEnable(isApiEnable):
-    return enable_all_api & isApiEnable
+def check_api_enable(is_api_enable):
+    return enable_all_api & is_api_enable
 
 
 @api_view(['GET', 'POST'])
@@ -183,14 +183,14 @@ def webhook(request):
 
 
 def change_leverage(symbol, leverage):
-    if not checkApiEnable(enable_change_leverage):
+    if not check_api_enable(enable_change_leverage):
         return None
 
     client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
 
 def get_usdt(req_id):
-    if not checkApiEnable(enable_get_usdt):
+    if not check_api_enable(enable_get_usdt):
         return None
 
     balances = client.futures_account_balance()
@@ -203,14 +203,14 @@ def get_usdt(req_id):
 
 
 def cancel_all_open_order(symbol):
-    if not checkApiEnable(enable_cancel_all_open_order):
+    if not check_api_enable(enable_cancel_all_open_order):
         return None
 
     client.futures_cancel_all_open_orders(symbol=symbol)
 
 
 def get_position(req_id, symbol):
-    if not checkApiEnable(enable_get_position):
+    if not check_api_enable(enable_get_position):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]))
@@ -230,7 +230,7 @@ def get_position(req_id, symbol):
 
 
 def close_position(req_id, symbol, side, quantity):
-    if not checkApiEnable(enable_close_position):
+    if not check_api_enable(enable_close_position):
         return None
 
     if side == '':
@@ -252,7 +252,7 @@ def close_position(req_id, symbol, side, quantity):
 
 
 def close_position_at_price(req_id, symbol, side, stop_price):
-    if not checkApiEnable(enable_close_position_at_price):
+    if not check_api_enable(enable_close_position_at_price):
         return None
 
     response = client.futures_create_order(
@@ -278,7 +278,7 @@ def create_order(
         stop_loss_stop_price,
         take_profit_stop_price
 ):
-    if not checkApiEnable(enable_create_order):
+    if not check_api_enable(enable_create_order):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]), 'create_order', symbol, side, quantity, entry)
