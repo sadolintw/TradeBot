@@ -133,3 +133,5 @@ from telegram.ext import *
 # print(signal_position_size==0)
 # print(round(float(signal_position_size), 3))
 # print(datetime.timestamp(datetime.now()) * 1000)
+
+print(json.loads('{"a":"test", "b":"test"}'))

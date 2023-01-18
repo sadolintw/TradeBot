@@ -27,6 +27,20 @@ def wrap_str(_str):
     return "[" + _str + "]"
 
 
+enable_all_api = False
+enable_change_leverage = True
+enable_get_usdt = True
+enable_cancel_all_open_order = True
+enable_get_position = True
+enable_close_position = True
+enable_close_position_at_price = True
+enable_create_order = True
+
+
+def checkApiEnable(isApiEnable):
+    return enable_all_api & isApiEnable
+
+
 @api_view(['GET', 'POST'])
 def webhook(request):
     body_unicode = request.body.decode('utf-8')
@@ -44,6 +58,10 @@ def webhook(request):
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphase correct')
                 signal_position_size = round(float(signal['position_size']), precision)
                 signal_symbol = signal['ticker']
+                signal_message_json = None
+                signal_message = signal['message']
+                if signal_message is not None:
+                    signal_message_json = json.loads(signal_message)
                 prev_quantity = 0
                 prev_opposite_side = ''
                 position = get_position(req_id=req_id, symbol=signal_symbol)
@@ -66,7 +84,7 @@ def webhook(request):
                 # if signal position == 0, close position
                 # and abs(float(prev_quantity)) > 0  ?
                 if signal_position_size == 0 and allowed_close_position:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'no position size, it is close signal')
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close signal')
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
@@ -89,13 +107,26 @@ def webhook(request):
                 usdt = get_usdt(req_id=req_id)
                 signal_entry = round(float(signal['entry']), precision)
                 signal_side = 'SELL' if signal['order'] == 'sell' else 'BUY'
-                signal_long_times = signal['strategy']['long']['times']
+                signal_long_times = int(signal['strategy']['long']['times'])
                 signal_long_stop_loss = signal['strategy']['long']['stopLoss']
                 signal_long_take_profit = signal['strategy']['long']['takeProfit']
-                signal_short_times = signal['strategy']['short']['times']
+                signal_short_times = int(signal['strategy']['short']['times'])
                 signal_short_stop_loss = signal['strategy']['short']['stopLoss']
                 signal_short_take_profit = signal['strategy']['short']['takeProfit']
                 raw_quantity = math.floor(100 * float(usdt) * percentage / signal_entry) / 100
+
+                # params override by message
+                if signal_message_json is not None:
+                    if signal_message_json['type'] == 'long_entry':
+                        signal_long_times = int(signal_message_json['lev'])
+                    elif signal_message_json['type'] == 'short_entry':
+                        signal_short_times = int(signal_message_json['lev'])
+
+                if signal_side == 'BUY':
+                    change_leverage(signal_symbol, signal_long_times)
+                else:
+                    change_leverage(signal_symbol, signal_short_times)
+
                 quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
                                  precision)
 
@@ -103,11 +134,30 @@ def webhook(request):
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', quantity)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'signal_position_size', signal_position_size)
 
-                # create order by signal
-                create_order(req_id, signal_symbol, signal_side, quantity, prev_quantity, prev_opposite_side,
-                             signal_entry, signal_long_stop_loss,
-                             signal_long_take_profit, signal_short_stop_loss,
-                             signal_short_take_profit, precision)
+                stop_loss_stop_price = round(
+                    (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
+                            float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), precision)
+
+                # params override by message
+                if signal_message_json is not None:
+                    stop_loss_stop_price = round(float(signal_message_json['sl']), precision)
+
+                take_profit_stop_price = round(
+                    (float(signal_entry) * (100 + float(signal_long_take_profit)) / 100) if signal_side == 'BUY' else (
+                            float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), precision)
+
+                create_order(
+                    req_id,
+                    signal_symbol,
+                    signal_side,
+                    quantity,
+                    prev_quantity,
+                    prev_opposite_side,
+                    signal_entry,
+                    'SELL' if signal_side == 'BUY' else 'BUY',
+                    stop_loss_stop_price,
+                    take_profit_stop_price
+                )
 
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
                 post_data = {
@@ -132,21 +182,37 @@ def webhook(request):
     return HttpResponse('received')
 
 
+def change_leverage(symbol, leverage):
+    if not checkApiEnable(enable_change_leverage):
+        return None
+
+    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+
+
 def get_usdt(req_id):
+    if not checkApiEnable(enable_get_usdt):
+        return None
+
     balances = client.futures_account_balance()
-    withdrawAvailableUSDT = 0
+    withdraw_available_usdt = 0
     for balance in balances:
         if balance['asset'] == 'USDT':
-            withdrawAvailableUSDT = balance['withdrawAvailable']
-    print(req_id, wrap_str(inspect.stack()[0][3]), withdrawAvailableUSDT)
-    return withdrawAvailableUSDT
+            withdraw_available_usdt = balance['withdrawAvailable']
+    print(req_id, wrap_str(inspect.stack()[0][3]), withdraw_available_usdt)
+    return withdraw_available_usdt
 
 
 def cancel_all_open_order(symbol):
+    if not checkApiEnable(enable_cancel_all_open_order):
+        return None
+
     client.futures_cancel_all_open_orders(symbol=symbol)
 
 
 def get_position(req_id, symbol):
+    if not checkApiEnable(enable_get_position):
+        return None
+
     print(req_id, wrap_str(inspect.stack()[0][3]))
     positions = client.futures_account()['positions']
     target = None
@@ -164,6 +230,9 @@ def get_position(req_id, symbol):
 
 
 def close_position(req_id, symbol, side, quantity):
+    if not checkApiEnable(enable_close_position):
+        return None
+
     if side == '':
         return
     precision = 3
@@ -183,6 +252,9 @@ def close_position(req_id, symbol, side, quantity):
 
 
 def close_position_at_price(req_id, symbol, side, stop_price):
+    if not checkApiEnable(enable_close_position_at_price):
+        return None
+
     response = client.futures_create_order(
         symbol=symbol,
         # side='SELL' if side == 'BUY' else 'BUY',
@@ -194,9 +266,21 @@ def close_position_at_price(req_id, symbol, side, stop_price):
     print(req_id, wrap_str(inspect.stack()[0][3]), response)
 
 
-def create_order(req_id, symbol, side, quantity, prev_quantity, prev_opposite_side, entry, long_stop_loss,
-                 long_take_profit, short_stop_loss, short_take_profit,
-                 precision):
+def create_order(
+        req_id,
+        symbol,
+        side,
+        quantity,
+        prev_quantity,
+        prev_opposite_side,
+        entry,
+        close_side,
+        stop_loss_stop_price,
+        take_profit_stop_price
+):
+    if not checkApiEnable(enable_create_order):
+        return None
+
     print(req_id, wrap_str(inspect.stack()[0][3]), 'create_order', symbol, side, quantity, entry)
 
     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
@@ -204,28 +288,11 @@ def create_order(req_id, symbol, side, quantity, prev_quantity, prev_opposite_si
         print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
         close_position(req_id=req_id, symbol=symbol, side=prev_opposite_side, quantity=prev_quantity)
 
-    stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
-    stop_loss_stop_price = round((float(entry) * (100 - float(long_stop_loss)) / 100) if side == 'BUY' else (
-            float(entry) * (100 + float(short_stop_loss)) / 100), precision)
-
-    take_profit_side = 'SELL' if side == 'BUY' else 'BUY'
-    take_profit_stop_price = round((float(entry) * (100 + float(long_take_profit)) / 100) if side == 'BUY' else (
-            float(entry) * (100 - float(short_take_profit)) / 100), precision)
-
     batch_payload = [
-        # {
-        #     # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
-        #     'symbol': symbol,
-        #     'type': 'LIMIT',
-        #     'quantity': str(quantity),
-        #     'side': side,
-        #     'timeInForce': 'GTC',
-        #     'price': str(entry)
-        # },
         {
             # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
             'symbol': symbol,
-            'type': 'MARKET',
+            'type': 'MARKET',  # or LIMIT
             'quantity': str(quantity),
             'side': side
             # 'timeInForce': 'GTC',
@@ -236,7 +303,7 @@ def create_order(req_id, symbol, side, quantity, prev_quantity, prev_opposite_si
             'symbol': symbol,
             'type': 'STOP_MARKET',
             'quantity': str(quantity),
-            'side': stop_loss_side,
+            'side': close_side,
             'stopPrice': str(stop_loss_stop_price),
             # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
@@ -246,7 +313,7 @@ def create_order(req_id, symbol, side, quantity, prev_quantity, prev_opposite_si
             'symbol': symbol,
             'type': 'TAKE_PROFIT_MARKET',
             'quantity': str(quantity),
-            'side': take_profit_side,
+            'side': close_side,
             'stopPrice': str(take_profit_stop_price),
             # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
