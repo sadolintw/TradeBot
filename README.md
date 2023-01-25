@@ -22,7 +22,7 @@ create Binance ETHUSDTPERP order by Trading View Signal
   "entry": "{{strategy.order.price}}",
   "message": "{{strategy.order.alert_message}}",
   "order": "{{strategy.order.action}}",
-  "passphase": "<your passphase>",
+  "passphrase": "<your passphrase>",
   "position_size": "{{strategy.position_size}}",
   "strategy": {
     "long": {

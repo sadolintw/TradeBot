@@ -27,7 +27,7 @@ def wrap_str(_str):
     return "[" + _str + "]"
 
 
-enable_all_api = True
+enable_all_api = False
 enable_change_leverage = True
 enable_get_usdt = True
 enable_cancel_all_open_order = True
@@ -35,6 +35,7 @@ enable_get_position = True
 enable_close_position = True
 enable_close_position_at_price = True
 enable_create_order = True
+enable_send_telegram = True
 
 
 def check_api_enable(is_api_enable):
@@ -54,14 +55,15 @@ def webhook(request):
     if body_unicode:
         try:
             signal = json.loads(body_unicode)
-            if signal['passphase'] == tradingview_passphase:
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphase correct')
+            if signal['passphrase'] == tradingview_passphase:
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase correct')
                 signal_position_size = round(float(signal['position_size']), precision)
                 signal_symbol = signal['ticker']
                 signal_message_json = None
                 signal_message = signal['message']
                 if signal_message is not None:
                     signal_message_json = json.loads(signal_message)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'signal message', signal_message_json)
                 prev_quantity = 0
                 prev_opposite_side = ''
                 position = get_position(req_id=req_id, symbol=signal_symbol)
@@ -75,6 +77,8 @@ def webhook(request):
                     now = datetime.now()
                     timestamp = datetime.timestamp(now) * 1000
                     # diff seconds
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'current timestamp', timestamp)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'prev timestamp', prev_update_time)
                     diff = (timestamp - prev_update_time) / 1000
                     allowed_close_position = True if diff > preserve_prev_position_second else False
 
@@ -88,14 +92,17 @@ def webhook(request):
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
-                    post_data = {
-                        'symbol': signal_symbol,
-                        'side': prev_opposite_side,
-                        'msg': 'close prev position'
-                    }
-                    response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
-                    content = response.content
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
+
+                    if check_api_enable(enable_send_telegram):
+                        post_data = {
+                            'symbol': signal_symbol,
+                            'side': prev_opposite_side,
+                            'msg': 'close prev position'
+                        }
+                        response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
+                        content = response.content
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
+
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
                     return HttpResponse('received')
 
@@ -105,21 +112,31 @@ def webhook(request):
 
                 # prepare param
                 usdt = get_usdt(req_id=req_id)
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
                 signal_entry = round(float(signal['entry']), precision)
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse side')
                 signal_side = 'SELL' if signal['order'] == 'sell' else 'BUY'
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times')
                 signal_long_times = int(signal['strategy']['long']['times'])
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long stop loss')
                 signal_long_stop_loss = signal['strategy']['long']['stopLoss']
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
                 signal_long_take_profit = signal['strategy']['long']['takeProfit']
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short times')
                 signal_short_times = int(signal['strategy']['short']['times'])
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short stop loss')
                 signal_short_stop_loss = signal['strategy']['short']['stopLoss']
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
                 signal_short_take_profit = signal['strategy']['short']['takeProfit']
-                raw_quantity = math.floor(100 * float(usdt) * percentage / signal_entry) / 100
+                raw_quantity = 0 if usdt is None else math.floor(100 * float(usdt) * percentage / signal_entry) / 100
 
                 # params override by message
-                if signal_message_json is not None:
+                if signal_message_json is not None and 'type' in signal_message_json:
                     if signal_message_json['type'] == 'long_entry':
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times from message')
                         signal_long_times = int(signal_message_json['lev'])
                     elif signal_message_json['type'] == 'short_entry':
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short times from message')
                         signal_short_times = int(signal_message_json['lev'])
 
                 if signal_side == 'BUY':
@@ -139,7 +156,8 @@ def webhook(request):
                             float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), precision)
 
                 # params override by message
-                if signal_message_json is not None:
+                if signal_message_json is not None and 'sl' in signal_message_json:
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse stop loss from message')
                     stop_loss_stop_price = round(float(signal_message_json['sl']), precision)
 
                 take_profit_stop_price = round(
@@ -170,7 +188,7 @@ def webhook(request):
                 content = response.content
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
             else:
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphase incorrect')
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase incorrect')
                 # send telegram msg
                 # requests.get('http://127.0.0.1:5000/telegram')
         except:
