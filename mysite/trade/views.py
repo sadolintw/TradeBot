@@ -27,7 +27,7 @@ def wrap_str(_str):
     return "[" + _str + "]"
 
 
-enable_all_api = False
+enable_all_api = True
 enable_change_leverage = True
 enable_get_usdt = True
 enable_cancel_all_open_order = True
@@ -39,7 +39,7 @@ enable_send_telegram = True
 
 
 def check_api_enable(is_api_enable):
-    return enable_all_api & is_api_enable
+    return enable_all_api and is_api_enable
 
 
 @api_view(['GET', 'POST'])
@@ -91,9 +91,9 @@ def webhook(request):
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close signal')
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
 
                     if check_api_enable(enable_send_telegram):
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
                         post_data = {
                             'symbol': signal_symbol,
                             'side': prev_opposite_side,
