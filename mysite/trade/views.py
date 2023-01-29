@@ -133,16 +133,16 @@ def webhook(request):
                 # params override by message
                 if signal_message_json is not None and 'type' in signal_message_json:
                     if signal_message_json['type'] == 'long_entry':
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times from message')
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long leverage from message')
                         signal_long_times = int(signal_message_json['lev'])
                     elif signal_message_json['type'] == 'short_entry':
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short times from message')
+                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short leverage from message')
                         signal_short_times = int(signal_message_json['lev'])
 
                 if signal_side == 'BUY':
-                    change_leverage(signal_symbol, signal_long_times)
+                    change_leverage(req_id, signal_symbol, signal_long_times)
                 else:
-                    change_leverage(signal_symbol, signal_short_times)
+                    change_leverage(req_id, signal_symbol, signal_short_times)
 
                 quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
                                  precision)
@@ -200,10 +200,11 @@ def webhook(request):
     return HttpResponse('received')
 
 
-def change_leverage(symbol, leverage):
+def change_leverage(req_id, symbol, leverage):
     if not check_api_enable(enable_change_leverage):
         return None
 
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'change leverage', symbol, leverage)
     client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
 

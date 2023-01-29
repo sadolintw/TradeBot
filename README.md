@@ -1,6 +1,9 @@
+<h1 align="center">TradeBot (Beta)</h1>
+---
+
 # Intro
 
-create Binance ETHUSDTPERP order by Trading View Signal
+create Binance ETHUSDTPERP order by Trading View Alert
 
 # Prerequisite
 
@@ -16,7 +19,7 @@ create Binance ETHUSDTPERP order by Trading View Signal
 
 - **TELEGRAM_BOT_CHAT_ID**
 
-# Signal Format
+# Alert Format
 ```json
 {
   "entry": "{{strategy.order.price}}",
