@@ -45,6 +45,8 @@ def check_api_enable(is_api_enable):
 @api_view(['GET', 'POST'])
 def webhook(request):
     body_unicode = request.body.decode('utf-8')
+    close_position_delay = 2
+    create_order_delay = 2
     precision = 2
     percentage = 0.95
     # percentage = 0.1
@@ -60,14 +62,23 @@ def webhook(request):
                 signal_position_size = round(float(signal['position_size']), precision)
                 signal_symbol = signal['ticker']
                 signal_message_json = None
+                signal_message_type = None
+                signal_message_lev = None
                 signal_message = signal['message']
                 if signal_message is not None:
                     signal_message_json = json.loads(signal_message)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'signal message', signal_message_json)
+                if signal_message_json is not None and 'type' in signal_message_json:
+                    signal_message_type = signal_message_json['type']
+                if signal_message_json is not None and 'lev' in signal_message_json:
+                    signal_message_lev = signal_message_json['lev']
                 prev_quantity = 0
                 prev_opposite_side = ''
-                position = get_position(req_id=req_id, symbol=signal_symbol)
                 allowed_close_position = False
+
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'check current position')
+                time.sleep(close_position_delay)
+                position = get_position(req_id=req_id, symbol=signal_symbol)
                 if position is not None:
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'position is not None')
                     prev_quantity = position['positionAmt']
@@ -91,25 +102,33 @@ def webhook(request):
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close signal')
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
                     close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
-
-                    if check_api_enable(enable_send_telegram):
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
-                        post_data = {
-                            'symbol': signal_symbol,
-                            'side': prev_opposite_side,
-                            'msg': 'close prev position'
-                        }
-                        response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
-                        content = response.content
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
+                    post_data = {
+                        'symbol': signal_symbol,
+                        'side': prev_opposite_side,
+                        'type': signal_message_type,
+                        'msg': 'close prev position'
+                    }
+                    send_telegram_message(req_id, post_data)
 
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
                     return HttpResponse('received')
 
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order')
                 cancel_all_open_order(symbol=signal_symbol)
-                time.sleep(1)
 
+                # handle exit signal
+                if signal_message_type == 'long_exit' or signal_message_type == 'short_exit':
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'exit: ', signal_message_json['type'])
+                    post_data = {
+                        'symbol': signal_symbol,
+                        'side': prev_opposite_side,
+                        'type': signal_message_type,
+                        'msg': 'close prev position'
+                    }
+                    send_telegram_message(req_id, post_data)
+                    return HttpResponse('received')
+
+                time.sleep(create_order_delay)
                 # prepare param
                 usdt = get_usdt(req_id=req_id)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
@@ -131,13 +150,12 @@ def webhook(request):
                 raw_quantity = 0 if usdt is None else math.floor(100 * float(usdt) * percentage / signal_entry) / 100
 
                 # params override by message
-                if signal_message_json is not None and 'type' in signal_message_json:
-                    if signal_message_json['type'] == 'long_entry':
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long leverage from message')
-                        signal_long_times = int(signal_message_json['lev'])
-                    elif signal_message_json['type'] == 'short_entry':
-                        print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short leverage from message')
-                        signal_short_times = int(signal_message_json['lev'])
+                if signal_message_type == 'long_entry':
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long leverage from message')
+                    signal_long_times = int(signal_message_lev)
+                elif signal_message_type == 'short_entry':
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short leverage from message')
+                    signal_short_times = int(signal_message_lev)
 
                 if signal_side == 'BUY':
                     change_leverage(req_id, signal_symbol, signal_long_times)
@@ -177,16 +195,15 @@ def webhook(request):
                     take_profit_stop_price
                 )
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
+                # entry exit
                 post_data = {
                     'symbol': signal_symbol,
                     'entry': signal_entry,
                     'side': signal_side,
                     'msg': 'create order'
                 }
-                response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
-                content = response.content
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
+                send_telegram_message(req_id, post_data)
+
             else:
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase incorrect')
                 # send telegram msg
@@ -198,6 +215,16 @@ def webhook(request):
 
     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
     return HttpResponse('received')
+
+
+def send_telegram_message(req_id, post_data):
+    if not check_api_enable(enable_send_telegram):
+        return None
+
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
+    response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
+    content = response.content
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
 
 
 def change_leverage(req_id, symbol, leverage):
@@ -356,4 +383,4 @@ def create_order(
     #     price=entry
     # )
     response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
-    print(req_id, wrap_str(inspect.stack()[0][3]), response)
+    print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response ", response)
