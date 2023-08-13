@@ -100,9 +100,11 @@ client = Client(api_key, api_secret)
 #     client.futures_order_book(symbol='ETHUSDT')
 # )
 
-# print(client.futures_get_open_orders(symbol='ETHUSDT'))
+print(client.futures_get_open_orders(symbol='ETHUSDT'))
 
-# print(client.futures_account_balance())
+print(client.futures_account_balance())
+print(client.futures_account())
+
 
 # positions = client.futures_account()['positions']
 # target = None
@@ -134,4 +136,4 @@ from telegram.ext import *
 # print(round(float(signal_position_size), 3))
 # print(datetime.timestamp(datetime.now()) * 1000)
 
-print(True and True)
+# print(True and True)

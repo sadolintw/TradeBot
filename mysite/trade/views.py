@@ -11,6 +11,13 @@ from django.http import HttpResponse
 # noinspection PyUnresolvedReferences
 from rest_framework.decorators import api_view
 from datetime import datetime
+import schedule
+import time
+import queue
+import threading
+
+notification_queue_entry = queue.Queue()
+notification_queue_exit = queue.Queue()
 
 api_key = os.environ['BINANCE_APIKEY']
 api_secret = os.environ['BINANCE_SECRETKEY']
@@ -38,13 +45,65 @@ enable_create_order = True
 enable_send_telegram = True
 
 
+def handlerA():
+    if not notification_queue_entry.empty():
+        message = notification_queue_entry.get()
+        print("Handling message:", message)
+        notification_queue_entry.task_done()
+
+
+def parse_type(notification):
+    notification_json = json.loads(notification)
+    notification_type = json.loads(notification_json['message'])
+    return notification_type['type']
+
+
+@api_view(['GET', 'POST'])
+def message(request):
+    req_id = wrap_str(str(uuid.uuid1()).split("-")[0])
+    print(req_id + "message")
+    plain = request.body.decode('utf-8')
+    print("type: " + parse_type(plain))
+    notification_queue_entry.put(plain)
+    return HttpResponse('received')
+
+
+##################
+
 def check_api_enable(is_api_enable):
     return enable_all_api and is_api_enable
 
 
 @api_view(['GET', 'POST'])
 def webhook(request):
-    body_unicode = request.body.decode('utf-8')
+    print("receive notification")
+    plain = request.body.decode('utf-8')
+    notification_type = parse_type(plain)
+    if notification_type == 'long_exit' or notification_type == 'short_exit':
+        notification_queue_exit.put(plain)
+    if notification_type == 'long_entry' or notification_type == 'short_entry':
+        notification_queue_entry.put(plain)
+    return HttpResponse('received')
+
+
+def handle_webhook_entry_schedule():
+    # print("handle_webhook_entry_schedule")
+    if notification_queue_exit.empty() and not notification_queue_entry.empty():
+        notification = notification_queue_entry.get()
+        handle_webhook(notification)
+        notification_queue_entry.task_done()
+
+
+def handle_webhook_exit_schedule():
+    # print("handle_webhook_exit_schedule")
+    if not notification_queue_exit.empty():
+        notification = notification_queue_exit.get()
+        handle_webhook(notification)
+        notification_queue_exit.task_done()
+
+
+def handle_webhook(body_unicode):
+    # body_unicode = request.body.decode('utf-8')
     close_position_delay = 2
     create_order_delay = 2
     precision = 2
@@ -56,15 +115,15 @@ def webhook(request):
     print(req_id, wrap_str(inspect.stack()[0][3]), 'received signal: ', body_unicode)
     if body_unicode:
         try:
-            signal = json.loads(body_unicode)
-            if signal['passphrase'] == tradingview_passphase:
+            notification = json.loads(body_unicode)
+            if notification['passphrase'] == tradingview_passphase:
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase correct')
-                signal_position_size = round(float(signal['position_size']), precision)
-                signal_symbol = signal['ticker']
+                signal_position_size = round(float(notification['position_size']), precision)
+                signal_symbol = notification['ticker']
                 signal_message_json = None
                 signal_message_type = None
                 signal_message_lev = None
-                signal_message = signal['message']
+                signal_message = notification['message']
                 if signal_message is not None:
                     signal_message_json = json.loads(signal_message)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'signal message', signal_message_json)
@@ -132,21 +191,21 @@ def webhook(request):
                 # prepare param
                 usdt = get_usdt(req_id=req_id)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
-                signal_entry = round(float(signal['entry']), precision)
+                signal_entry = round(float(notification['entry']), precision)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse side')
-                signal_side = 'SELL' if signal['order'] == 'sell' else 'BUY'
+                signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times')
-                signal_long_times = int(signal['strategy']['long']['times'])
+                signal_long_times = int(notification['strategy']['long']['times'])
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long stop loss')
-                signal_long_stop_loss = signal['strategy']['long']['stopLoss']
+                signal_long_stop_loss = notification['strategy']['long']['stopLoss']
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
-                signal_long_take_profit = signal['strategy']['long']['takeProfit']
+                signal_long_take_profit = notification['strategy']['long']['takeProfit']
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short times')
-                signal_short_times = int(signal['strategy']['short']['times'])
+                signal_short_times = int(notification['strategy']['short']['times'])
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short stop loss')
-                signal_short_stop_loss = signal['strategy']['short']['stopLoss']
+                signal_short_stop_loss = notification['strategy']['short']['stopLoss']
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
-                signal_short_take_profit = signal['strategy']['short']['takeProfit']
+                signal_short_take_profit = notification['strategy']['short']['takeProfit']
                 raw_quantity = 0 if usdt is None else math.floor(100 * float(usdt) * percentage / signal_entry) / 100
 
                 # params override by message
@@ -200,6 +259,7 @@ def webhook(request):
                     'symbol': signal_symbol,
                     'entry': signal_entry,
                     'side': signal_side,
+                    'type': signal_message_type,
                     'msg': 'create order'
                 }
                 send_telegram_message(req_id, post_data)
@@ -260,6 +320,7 @@ def get_position(req_id, symbol):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]))
+    client.FUTURES_API_VERSION2
     positions = client.futures_account()['positions']
     target = None
     for position in positions:
@@ -384,3 +445,20 @@ def create_order(
     # )
     response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
     print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response ", response)
+
+
+##############
+
+def run_schedule():
+    # 每 5 秒運行一次
+    schedule.every(5).seconds.do(handle_webhook_entry_schedule)
+    schedule.every(5).seconds.do(handle_webhook_exit_schedule)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+# 在單獨的線程中運行定時任務
+entry_schedule_thread = threading.Thread(target=run_schedule, daemon=True)
+entry_schedule_thread.start()

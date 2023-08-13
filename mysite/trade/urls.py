@@ -4,5 +4,6 @@ from . import views
 
 urlpatterns = [
     path('', views.index, name='index'),
-    path('webhook', views.webhook, name='webhook')
+    path('webhook', views.webhook, name='webhook'),
+    path('_675207c0', views.message, name='message')
 ]
