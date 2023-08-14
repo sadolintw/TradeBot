@@ -100,10 +100,10 @@ client = Client(api_key, api_secret)
 #     client.futures_order_book(symbol='ETHUSDT')
 # )
 
-print(client.futures_get_open_orders(symbol='ETHUSDT'))
+# print(client.futures_get_open_orders(symbol='ETHUSDT'))
 
 print(client.futures_account_balance())
-print(client.futures_account())
+# print(client.futures_account())
 
 
 # positions = client.futures_account()['positions']

@@ -303,7 +303,7 @@ def get_usdt(req_id):
     withdraw_available_usdt = 0
     for balance in balances:
         if balance['asset'] == 'USDT':
-            withdraw_available_usdt = balance['withdrawAvailable']
+            withdraw_available_usdt = balance['availableBalance']
     print(req_id, wrap_str(inspect.stack()[0][3]), withdraw_available_usdt)
     return withdraw_available_usdt
 
@@ -320,7 +320,6 @@ def get_position(req_id, symbol):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]))
-    client.FUTURES_API_VERSION2
     positions = client.futures_account()['positions']
     target = None
     for position in positions:
