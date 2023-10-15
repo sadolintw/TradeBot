@@ -44,6 +44,11 @@ enable_close_position_at_price = True
 enable_create_order = True
 enable_send_telegram = True
 
+exchange_info_map = {}
+
+def format_decimal(value, digit):
+    format_string = "{:." + str(digit) + "f}"
+    return format_string.format(value)
 
 def handlerA():
     if not notification_queue_entry.empty():
@@ -73,6 +78,22 @@ def message(request):
 def check_api_enable(is_api_enable):
     return enable_all_api and is_api_enable
 
+##################
+
+#get exchange info
+exchange_info = client.futures_exchange_info()
+exchange_info_map
+for symbol_info in exchange_info["symbols"]:
+    symbol = symbol_info["symbol"]
+    price_precision = symbol_info["pricePrecision"]
+    quantity_precision = symbol_info["quantityPrecision"]
+    exchange_info_map[symbol] = {
+        "pricePrecision": price_precision,
+        "quantityPrecision": quantity_precision
+    }
+
+# 打印結果
+print(exchange_info_map)
 
 @api_view(['GET', 'POST'])
 def webhook(request):
@@ -106,7 +127,7 @@ def handle_webhook(body_unicode):
     # body_unicode = request.body.decode('utf-8')
     close_position_delay = 2
     create_order_delay = 2
-    precision = 2
+    # precision = 2
     percentage = 0.95
     # percentage = 0.1
     # preserve prev position exists less than
@@ -118,8 +139,10 @@ def handle_webhook(body_unicode):
             notification = json.loads(body_unicode)
             if notification['passphrase'] == tradingview_passphase:
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase correct')
-                signal_position_size = round(float(notification['position_size']), precision)
                 signal_symbol = notification['ticker']
+                _price_precision = int(exchange_info_map[signal_symbol]['pricePrecision'])
+                _quantity_precision = int(exchange_info_map[signal_symbol]['quantityPrecision'])
+                signal_position_size = round(float(notification['position_size']), _quantity_precision)
                 signal_message_json = None
                 signal_message_type = None
                 signal_message_lev = None
@@ -191,7 +214,7 @@ def handle_webhook(body_unicode):
                 # prepare param
                 usdt = get_usdt(req_id=req_id)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
-                signal_entry = round(float(notification['entry']), precision)
+                signal_entry = round(float(notification['entry']), _price_precision)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse side')
                 signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times')
@@ -222,7 +245,7 @@ def handle_webhook(body_unicode):
                     change_leverage(req_id, signal_symbol, signal_short_times)
 
                 quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
-                                 precision)
+                                 _quantity_precision)
 
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'raw_quantity', raw_quantity)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', quantity)
@@ -230,16 +253,16 @@ def handle_webhook(body_unicode):
 
                 stop_loss_stop_price = round(
                     (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
-                            float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), precision)
+                            float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), _price_precision)
 
                 # params override by message
                 if signal_message_json is not None and 'sl' in signal_message_json:
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'parse stop loss from message')
-                    stop_loss_stop_price = round(float(signal_message_json['sl']), precision)
+                    stop_loss_stop_price = round(float(signal_message_json['sl']), _price_precision)
 
                 take_profit_stop_price = round(
                     (float(signal_entry) * (100 + float(signal_long_take_profit)) / 100) if signal_side == 'BUY' else (
-                            float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), precision)
+                            float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), _price_precision)
 
                 create_order(
                     req_id,
@@ -341,15 +364,15 @@ def close_position(req_id, symbol, side, quantity):
 
     if side == '':
         return
-    precision = 3
-    print(req_id, wrap_str(inspect.stack()[0][3]), symbol, side, round(float(quantity), precision))
+    _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
+    print(req_id, wrap_str(inspect.stack()[0][3]), symbol, side, round(float(quantity), _quantity_precision))
     if abs(float(quantity)) != 0.0:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
         response = client.futures_create_order(
             symbol=symbol,
             type="MARKET",
             side=side,
-            quantity=round(abs(float(quantity)), precision),
+            quantity=round(abs(float(quantity)), _quantity_precision),
             reduceOnly='True'
         )
         print(req_id, wrap_str(inspect.stack()[0][3]), 'succ', response)
@@ -393,13 +416,14 @@ def create_order(
     if abs(float(prev_quantity)) > 0.0:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
         close_position(req_id=req_id, symbol=symbol, side=prev_opposite_side, quantity=prev_quantity)
-
+    _price_precision = int(exchange_info_map[symbol]['pricePrecision'])
+    _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
     batch_payload = [
         {
             # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
             'symbol': symbol,
             'type': 'MARKET',  # or LIMIT
-            'quantity': str(quantity),
+            'quantity': format_decimal(quantity, _quantity_precision),
             'side': side
             # 'timeInForce': 'GTC',
             # 'price': str(entry)
@@ -408,9 +432,9 @@ def create_order(
             # 'newClientOrderId': '6925e0cb-2d86-42af-875c-877da7b5fda5',
             'symbol': symbol,
             'type': 'STOP_MARKET',
-            'quantity': str(quantity),
+            'quantity': format_decimal(quantity, _quantity_precision),
             'side': close_side,
-            'stopPrice': str(stop_loss_stop_price),
+            'stopPrice': format_decimal(stop_loss_stop_price, _price_precision),
             # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
         },
@@ -418,9 +442,9 @@ def create_order(
             # 'newClientOrderId': '121637a9-e15a-4f44-b62d-d424fb4870e0',
             'symbol': symbol,
             'type': 'TAKE_PROFIT_MARKET',
-            'quantity': str(quantity),
+            'quantity': format_decimal(quantity, _quantity_precision),
             'side': close_side,
-            'stopPrice': str(take_profit_stop_price),
+            'stopPrice': format_decimal(take_profit_stop_price, _price_precision),
             # 'timeInForce': 'GTE_GTC',
             'reduceOnly': 'True'
         }
