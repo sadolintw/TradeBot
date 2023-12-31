@@ -3,6 +3,8 @@ import math
 import sys
 import os
 import uuid
+from decimal import Decimal
+
 import requests
 import inspect
 import time
@@ -15,12 +17,15 @@ import schedule
 import time
 import queue
 import threading
+from .utils import strategy_list, find_strategy_by_passphrase, find_balance_by_strategy_id, create_trades_from_binance, format_decimal, get_main_account_info
 
 notification_queue_entry = queue.Queue()
 notification_queue_exit = queue.Queue()
 
-api_key = os.environ['BINANCE_APIKEY']
-api_secret = os.environ['BINANCE_SECRETKEY']
+main_account = get_main_account_info()
+
+api_key = main_account.api_key
+api_secret = main_account.api_secret
 
 client = Client(api_key, api_secret)
 tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
@@ -46,9 +51,6 @@ enable_send_telegram = True
 
 exchange_info_map = {}
 
-def format_decimal(value, digit):
-    format_string = "{:." + str(digit) + "f}"
-    return format_string.format(value)
 
 def handlerA():
     if not notification_queue_entry.empty():
@@ -78,9 +80,10 @@ def message(request):
 def check_api_enable(is_api_enable):
     return enable_all_api and is_api_enable
 
+
 ##################
 
-#get exchange info
+# get exchange info
 exchange_info = client.futures_exchange_info()
 exchange_info_map
 for symbol_info in exchange_info["symbols"]:
@@ -94,6 +97,8 @@ for symbol_info in exchange_info["symbols"]:
 
 # 打印結果
 print(exchange_info_map)
+# 打印目前策略
+strategy_list()
 
 @api_view(['GET', 'POST'])
 def webhook(request):
@@ -127,18 +132,19 @@ def handle_webhook(body_unicode):
     # body_unicode = request.body.decode('utf-8')
     close_position_delay = 2
     create_order_delay = 2
-    # precision = 2
     percentage = 0.95
-    # percentage = 0.1
     # preserve prev position exists less than
-    preserve_prev_position_second = 30
+    preserve_prev_position_second = 20
     req_id = wrap_str(str(uuid.uuid1()).split("-")[0])
     print(req_id, wrap_str(inspect.stack()[0][3]), 'received signal: ', body_unicode)
     if body_unicode:
         try:
             notification = json.loads(body_unicode)
-            if notification['passphrase'] == tradingview_passphase:
+            strategy = find_strategy_by_passphrase(notification['passphrase'])
+            if strategy is not None:
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase correct')
+                strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'strategy client', strategy_client)
                 signal_symbol = notification['ticker']
                 _price_precision = int(exchange_info_map[signal_symbol]['pricePrecision'])
                 _quantity_precision = int(exchange_info_map[signal_symbol]['quantityPrecision'])
@@ -146,6 +152,7 @@ def handle_webhook(body_unicode):
                 signal_message_json = None
                 signal_message_type = None
                 signal_message_lev = None
+                signal_message_eq = None
                 signal_message = notification['message']
                 if signal_message is not None:
                     signal_message_json = json.loads(signal_message)
@@ -154,13 +161,18 @@ def handle_webhook(body_unicode):
                     signal_message_type = signal_message_json['type']
                 if signal_message_json is not None and 'lev' in signal_message_json:
                     signal_message_lev = signal_message_json['lev']
+                if signal_message_json is not None and 'eq' in signal_message_json:
+                    signal_message_eq = int(float(signal_message_json['eq']))
+                    if signal_message_eq > 95:
+                        signal_message_eq = 95
+                    percentage = signal_message_eq / 100
                 prev_quantity = 0
                 prev_opposite_side = ''
                 allowed_close_position = False
 
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'check current position')
                 time.sleep(close_position_delay)
-                position = get_position(req_id=req_id, symbol=signal_symbol)
+                position = get_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol)
                 if position is not None:
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'position is not None')
                     prev_quantity = position['positionAmt']
@@ -182,8 +194,10 @@ def handle_webhook(body_unicode):
                 # and abs(float(prev_quantity)) > 0  ?
                 if signal_position_size == 0 and allowed_close_position:
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close signal')
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order for close signal')
+                    cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
-                    close_position(req_id=req_id, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
+                    close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
                     post_data = {
                         'symbol': signal_symbol,
                         'side': prev_opposite_side,
@@ -194,9 +208,6 @@ def handle_webhook(body_unicode):
 
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
                     return HttpResponse('received')
-
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order')
-                cancel_all_open_order(symbol=signal_symbol)
 
                 # handle exit signal
                 if signal_message_type == 'long_exit' or signal_message_type == 'short_exit':
@@ -210,9 +221,31 @@ def handle_webhook(body_unicode):
                     send_telegram_message(req_id, post_data)
                     return HttpResponse('received')
 
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order for entry signal')
+                cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
+
                 time.sleep(create_order_delay)
                 # prepare param
-                usdt = get_usdt(req_id=req_id)
+                all_usdt = Decimal(get_usdt(req_id=req_id, strategy_client=strategy_client))
+                balance = find_balance_by_strategy_id(strategy.strategy_id)
+
+                if balance is not None:
+                    usdt = balance.balance
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'has corresponding balance', usdt)
+                    balance.equity = percentage
+                    balance.save()
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'update equity %', percentage)
+                else:
+                    usdt = strategy.initial_capital
+
+                if usdt > all_usdt:
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'exceed all usdt')
+                    usdt = all_usdt
+
+                usdt = str(usdt)
+
+                print(req_id, wrap_str(inspect.stack()[0][3]), 'used usdt', usdt)
+
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
                 signal_entry = round(float(notification['entry']), _price_precision)
                 print(req_id, wrap_str(inspect.stack()[0][3]), 'parse side')
@@ -240,9 +273,9 @@ def handle_webhook(body_unicode):
                     signal_short_times = int(signal_message_lev)
 
                 if signal_side == 'BUY':
-                    change_leverage(req_id, signal_symbol, signal_long_times)
+                    change_leverage(req_id, strategy_client, signal_symbol, signal_long_times)
                 else:
-                    change_leverage(req_id, signal_symbol, signal_short_times)
+                    change_leverage(req_id, strategy_client, signal_symbol, signal_short_times)
 
                 quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
                                  _quantity_precision)
@@ -266,6 +299,8 @@ def handle_webhook(body_unicode):
 
                 create_order(
                     req_id,
+                    strategy_client,
+                    strategy,
                     signal_symbol,
                     signal_side,
                     quantity,
@@ -310,19 +345,19 @@ def send_telegram_message(req_id, post_data):
     print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
 
 
-def change_leverage(req_id, symbol, leverage):
+def change_leverage(req_id, strategy_client, symbol, leverage):
     if not check_api_enable(enable_change_leverage):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]), 'change leverage', symbol, leverage)
-    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+    strategy_client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
 
-def get_usdt(req_id):
+def get_usdt(req_id, strategy_client):
     if not check_api_enable(enable_get_usdt):
         return None
 
-    balances = client.futures_account_balance()
+    balances = strategy_client.futures_account_balance()
     withdraw_available_usdt = 0
     for balance in balances:
         if balance['asset'] == 'USDT':
@@ -331,19 +366,19 @@ def get_usdt(req_id):
     return withdraw_available_usdt
 
 
-def cancel_all_open_order(symbol):
+def cancel_all_open_order(symbol, strategy_client):
     if not check_api_enable(enable_cancel_all_open_order):
         return None
 
-    client.futures_cancel_all_open_orders(symbol=symbol)
+    strategy_client.futures_cancel_all_open_orders(symbol=symbol)
 
 
-def get_position(req_id, symbol):
+def get_position(req_id, strategy_client, symbol):
     if not check_api_enable(enable_get_position):
         return None
 
     print(req_id, wrap_str(inspect.stack()[0][3]))
-    positions = client.futures_account()['positions']
+    positions = strategy_client.futures_account()['positions']
     target = None
     for position in positions:
         if position['symbol'] == symbol:
@@ -358,7 +393,7 @@ def get_position(req_id, symbol):
     return None
 
 
-def close_position(req_id, symbol, side, quantity):
+def close_position(req_id, strategy_client, symbol, side, quantity):
     if not check_api_enable(enable_close_position):
         return None
 
@@ -366,9 +401,11 @@ def close_position(req_id, symbol, side, quantity):
         return
     _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
     print(req_id, wrap_str(inspect.stack()[0][3]), symbol, side, round(float(quantity), _quantity_precision))
+    # cancel_order_response = client.futures_cancel_all_open_orders(symbol=symbol)
+    # print('cancel_order_response', cancel_order_response)
     if abs(float(quantity)) != 0.0:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
-        response = client.futures_create_order(
+        response = strategy_client.futures_create_order(
             symbol=symbol,
             type="MARKET",
             side=side,
@@ -380,11 +417,11 @@ def close_position(req_id, symbol, side, quantity):
         print(req_id, wrap_str(inspect.stack()[0][3]), 'no position')
 
 
-def close_position_at_price(req_id, symbol, side, stop_price):
+def close_position_at_price(req_id, strategy_client, symbol, side, stop_price):
     if not check_api_enable(enable_close_position_at_price):
         return None
 
-    response = client.futures_create_order(
+    response = strategy_client.futures_create_order(
         symbol=symbol,
         # side='SELL' if side == 'BUY' else 'BUY',
         side=side,
@@ -397,6 +434,8 @@ def close_position_at_price(req_id, symbol, side, stop_price):
 
 def create_order(
         req_id,
+        strategy_client,
+        strategy,
         symbol,
         side,
         quantity,
@@ -407,67 +446,135 @@ def create_order(
         stop_loss_stop_price,
         take_profit_stop_price
 ):
-    if not check_api_enable(enable_create_order):
-        return None
-
     print(req_id, wrap_str(inspect.stack()[0][3]), 'create_order', symbol, side, quantity, entry)
-
     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
     if abs(float(prev_quantity)) > 0.0:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
         close_position(req_id=req_id, symbol=symbol, side=prev_opposite_side, quantity=prev_quantity)
     _price_precision = int(exchange_info_map[symbol]['pricePrecision'])
     _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity precision', _quantity_precision)
+    if (format_decimal(quantity, _quantity_precision)) == 0:
+        print(req_id, wrap_str(inspect.stack()[0][3]), 'Unable to open a position: the quantity becomes 0 after precision adjustment')
+
+
+    # 先計算前三個止盈點的訂單量
+    quantity_level1 = format_decimal(quantity * (1 / 11), _quantity_precision)  # 1/(1+2+3+5) 的倉位大小
+    quantity_level2 = format_decimal(quantity * (2 / 11), _quantity_precision)  # 2/(1+2+3+5) 的倉位大小
+    quantity_level3 = format_decimal(quantity * (3 / 11), _quantity_precision)  # 3/(1+2+3+5) 的倉位大小
+
+    # 初始化止盈點價格
+    take_profit_price1 = take_profit_price2 = take_profit_price3 = take_profit_price4 = 0
+
+    # 計算兩價格之間的差值
+    price_difference = take_profit_stop_price - entry
+    quarter_difference = abs(price_difference / 4)  # 取絕對值確保quarter_difference總是正值
+
+    if side == 'BUY':
+        take_profit_price1 = format_decimal(entry + quarter_difference, _price_precision)  # 第1/4的位置
+        take_profit_price2 = format_decimal(entry + 2 * quarter_difference, _price_precision)  # 第2/4的位置
+        take_profit_price3 = format_decimal(entry + 3 * quarter_difference, _price_precision)  # 第3/4的位置
+        take_profit_price4 = format_decimal(take_profit_stop_price, _price_precision)  # 第4/4的位置，即take_profit_stop_price
+    elif side == 'SELL':
+        take_profit_price1 = format_decimal(entry - quarter_difference, _price_precision)  # 第1/4的位置
+        take_profit_price2 = format_decimal(entry - 2 * quarter_difference, _price_precision)  # 第2/4的位置
+        take_profit_price3 = format_decimal(entry - 3 * quarter_difference, _price_precision)  # 第3/4的位置
+        take_profit_price4 = format_decimal(take_profit_stop_price, _price_precision)  # 第4/4的位置，即take_profit_stop_price
+
+    # 止損價格
+    _stop_loss_stop_price = format_decimal(stop_loss_stop_price, _price_precision)
+
+    # batch order 上限為5 因此分兩次開單
+    # 構造訂單 1
     batch_payload = [
+        # 市價入場
         {
-            # 'newClientOrderId': '467fba09-a286-43c3-a79a-32efec4be80e',
             'symbol': symbol,
-            'type': 'MARKET',  # or LIMIT
+            'type': 'MARKET',
             'quantity': format_decimal(quantity, _quantity_precision),
             'side': side
-            # 'timeInForce': 'GTC',
-            # 'price': str(entry)
         },
+        # 第四止盈點 (全部平倉)
         {
-            # 'newClientOrderId': '6925e0cb-2d86-42af-875c-877da7b5fda5',
-            'symbol': symbol,
-            'type': 'STOP_MARKET',
-            'quantity': format_decimal(quantity, _quantity_precision),
-            'side': close_side,
-            'stopPrice': format_decimal(stop_loss_stop_price, _price_precision),
-            # 'timeInForce': 'GTE_GTC',
-            'reduceOnly': 'True'
-        },
-        {
-            # 'newClientOrderId': '121637a9-e15a-4f44-b62d-d424fb4870e0',
             'symbol': symbol,
             'type': 'TAKE_PROFIT_MARKET',
-            'quantity': format_decimal(quantity, _quantity_precision),
+            'quantity': '0',
+            'closePosition': 'true',
             'side': close_side,
-            'stopPrice': format_decimal(take_profit_stop_price, _price_precision),
-            # 'timeInForce': 'GTE_GTC',
-            'reduceOnly': 'True'
+            'priceProtect': 'true',
+            'workingType': 'MARK_PRICE',
+            'stopPrice': take_profit_price4
+        },
+        # 倉位止損
+        {
+            'symbol': symbol,
+            'type': 'STOP_MARKET',
+            'quantity': '0',
+            'closePosition': 'true',
+            'side': close_side,
+            'priceProtect': 'true',
+            'workingType': 'MARK_PRICE',
+            'stopPrice': _stop_loss_stop_price
         }
     ]
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'batch order', json.dumps(batch_payload), '\r\n')
-    # response = client.create_test_order(
-    #     symbol=symbol,
-    #     side=side,
-    #     type='LIMIT',
-    #     quantity=quantity,
-    #     timeInForce='GTC',
-    #     price=entry
-    # )
-    # response = client.futures_create_order(
-    #     symbol=symbol,
-    #     side=side,
-    #     type='LIMIT',
-    #     quantity=quantity,
-    #     timeInForce='GTC',
-    #     price=entry
-    # )
-    response = client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
-    print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response ", response)
+
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'batch order 1', json.dumps(batch_payload), '\r\n')
+    if check_api_enable(enable_create_order):
+        response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+        # 創建Trade實例
+        create_trades_from_binance(response, strategy.strategy_id)
+        print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 1", response)
+
+    time.sleep(2)
+
+    if float(format_decimal(float(quantity_level1), _quantity_precision)) == 0:
+        quantity_message = f"Unable to open a position: the quantity becomes 0 after precision adjustment"
+        print(req_id, wrap_str(inspect.stack()[0][3]), quantity_message)
+        return
+
+    # 構造訂單 2
+    batch_payload = [
+        # 第一止盈點
+        {
+            'symbol': symbol,
+            'type': 'TAKE_PROFIT_MARKET',
+            'quantity': quantity_level1,
+            'side': close_side,
+            'reduceOnly': 'true',
+            'priceProtect': 'true',
+            'workingType': 'MARK_PRICE',
+            'stopPrice': take_profit_price1
+        },
+        # 第二止盈點
+        {
+            'symbol': symbol,
+            'type': 'TAKE_PROFIT_MARKET',
+            'quantity': quantity_level2,
+            'side': close_side,
+            'reduceOnly': 'true',
+            'priceProtect': 'true',
+            'workingType': 'MARK_PRICE',
+            'stopPrice': take_profit_price2
+        },
+        # 第三止盈點
+        {
+            'symbol': symbol,
+            'type': 'TAKE_PROFIT_MARKET',
+            'quantity': quantity_level3,
+            'side': close_side,
+            'reduceOnly': 'true',
+            'priceProtect': 'true',
+            'workingType': 'MARK_PRICE',
+            'stopPrice': take_profit_price3
+        }
+    ]
+
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'batch order 2', json.dumps(batch_payload), '\r\n')
+    if check_api_enable(enable_create_order):
+        response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+        # 創建Trade實例
+        create_trades_from_binance(response, strategy.strategy_id)
+        print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 2", response)
 
 
 ##############
