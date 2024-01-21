@@ -27,6 +27,7 @@ class Strategy(models.Model):
     exit_criteria = models.TextField(blank=True, null=True)
     status = models.CharField(max_length=50, blank=True, null=True)
     passphrase = models.CharField(max_length=36, blank=True, null=True)
+    trade_group_id = models.CharField(max_length=36, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -38,6 +39,7 @@ class Strategy(models.Model):
                 f"Initial Capital: {self.initial_capital}, Risk Parameters: {self.risk_parameters}, "
                 f"Entry Criteria: {self.entry_criteria}, Exit Criteria: {self.exit_criteria}, "
                 f"Status: {self.status}, Passphrase: {self.passphrase}, "
+                f"Trade Group ID: {self.trade_group_id}, "
                 f"Created At: {self.created_at}, Updated At: {self.updated_at}")
 
 class Trade(models.Model):
@@ -45,11 +47,13 @@ class Trade(models.Model):
     thirdparty_id = models.BigIntegerField()
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
     symbol = models.CharField(max_length=20)
-    trade_type = models.CharField(max_length=4)
+    trade_side = models.CharField(max_length=4)
+    trade_type = models.CharField(max_length=20)
     quantity = models.DecimalField(max_digits=10, decimal_places=2)
     price = models.DecimalField(max_digits=10, decimal_places=2)
     profit_loss = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     cumulative_profit_loss = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    trade_group_id = models.CharField(max_length=36, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -58,8 +62,10 @@ class Trade(models.Model):
 
     def __str__(self):
         return (f"Trade ID: {self.trade_id}, Strategy ID: {self.strategy_id}, Symbol: {self.symbol}, "
-                f"Trade Type: {self.trade_type}, Quantity: {self.quantity}, Price: {self.price}, "
-                f"Profit/Loss: {self.profit_loss}, Cumulative Profit/Loss: {self.cumulative_profit_loss}, "
+                f"Trade Side: {self.trade_side}, Trade Type: {self.trade_type}, Quantity: {self.quantity}, "
+                f"Price: {self.price}, Profit/Loss: {self.profit_loss}, "
+                f"Cumulative Profit/Loss: {self.cumulative_profit_loss}, "
+                f"Trade Group ID: {self.trade_group_id}, "
                 f"Created At: {self.created_at}, Updated At: {self.updated_at}")
 
 class AccountBalance(models.Model):

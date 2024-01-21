@@ -17,7 +17,19 @@ import schedule
 import time
 import queue
 import threading
-from .utils import strategy_list, find_strategy_by_passphrase, find_balance_by_strategy_id, create_trades_from_binance, format_decimal, get_main_account_info
+from .utils import (
+    strategy_list,
+    find_strategy_by_passphrase,
+    find_balance_by_strategy_id,
+    create_trades_from_binance,
+    format_decimal,
+    get_main_account_info,
+    convert_to_trade_array,
+    query_trades_by_group_id,
+    calculate_total_realized_pnl,
+    update_account_balance,
+    update_trade_profit_loss
+)
 
 notification_queue_entry = queue.Queue()
 notification_queue_exit = queue.Queue()
@@ -50,14 +62,6 @@ enable_create_order = True
 enable_send_telegram = True
 
 exchange_info_map = {}
-
-
-def handlerA():
-    if not notification_queue_entry.empty():
-        message = notification_queue_entry.get()
-        print("Handling message:", message)
-        notification_queue_entry.task_done()
-
 
 def parse_type(notification):
     notification_json = json.loads(notification)
@@ -197,15 +201,37 @@ def handle_webhook(body_unicode):
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order for close signal')
                     cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
-                    close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
+                    close_response = close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close response', close_response)
+
+                    # 更新Strategy狀態
+                    strategy.status = "INACTIVE"
+                    strategy.save()
+
                     post_data = {
                         'symbol': signal_symbol,
                         'side': prev_opposite_side,
                         'type': signal_message_type,
                         'msg': 'close prev position'
                     }
-                    send_telegram_message(req_id, post_data)
+                    try:
+                        send_telegram_message(req_id, post_data)
+                    except Exception as e:
+                        print(f"An error occurred while sending Telegram message: {e}")
 
+                    trade_array = convert_to_trade_array(response=close_response, trade_type_override='EXIT')
+                    create_trades_from_binance(binance_trades=trade_array, strategy_id=strategy.strategy_id, trade_group_id=strategy.trade_group_id)
+                    order_list = query_trades_by_group_id(strategy.trade_group_id)
+
+                    print('order list', order_list)
+                    # 更新該策略的balace
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'calculate total realized pnl')
+                    total_realized_pnl = calculate_total_realized_pnl(
+                        client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), 'total_realized_pnl', total_realized_pnl)
+                    print(req_id, wrap_str(inspect.stack()[0][3]), update_account_balance(total_realized_pnl, strategy.strategy_id))
+                    # 更新已實現盈虧到出場紀錄
+                    update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
                     print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
                     return HttpResponse('received')
 
@@ -413,6 +439,7 @@ def close_position(req_id, strategy_client, symbol, side, quantity):
             reduceOnly='True'
         )
         print(req_id, wrap_str(inspect.stack()[0][3]), 'succ', response)
+        return response
     else:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'no position')
 
@@ -457,6 +484,9 @@ def create_order(
     if (format_decimal(quantity, _quantity_precision)) == 0:
         print(req_id, wrap_str(inspect.stack()[0][3]), 'Unable to open a position: the quantity becomes 0 after precision adjustment')
 
+    # 建立trade_group_id
+    trade_group_id = uuid.uuid4()
+    print(req_id, wrap_str(inspect.stack()[0][3]), 'trade_group_id ', trade_group_id)
 
     # 先計算前三個止盈點的訂單量
     quantity_level1 = format_decimal(quantity * (1 / 11), _quantity_precision)  # 1/(1+2+3+5) 的倉位大小
@@ -522,7 +552,11 @@ def create_order(
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
-        create_trades_from_binance(response, strategy.strategy_id)
+        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id, trade_group_id=trade_group_id)
+        # 更新Strategy狀態
+        strategy.status = "ACTIVE"
+        strategy.trade_group_id = trade_group_id
+        strategy.save()
         print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 1", response)
 
     time.sleep(2)
@@ -573,7 +607,7 @@ def create_order(
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
-        create_trades_from_binance(response, strategy.strategy_id)
+        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id, trade_group_id=trade_group_id)
         print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 2", response)
 
 

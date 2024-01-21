@@ -17,7 +17,7 @@ COMMENT ON COLUMN account_info.other_info IS '其他帳戶相關信息';
 COMMENT ON COLUMN account_info.created_at IS '記錄創建時間';
 COMMENT ON COLUMN account_info.updated_at IS '記錄最後更新時間';
 
--- Strategies Table with 'passphrase' column
+-- Strategies Table
 CREATE TABLE strategies (
     strategy_id SERIAL PRIMARY KEY, -- 策略的唯一識別碼
     account_id INT REFERENCES account_info(account_id), -- 關聯的帳戶ID
@@ -28,6 +28,7 @@ CREATE TABLE strategies (
     exit_criteria TEXT, -- 出場標準
     status VARCHAR(50), -- 策略的當前狀態
     passphrase VARCHAR(36), -- 用於接收 Trading View 訊號的 UUID
+    trade_group_id varchar(36) NULL, -- 交易群組ID
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP, -- 紀錄創建時間
     updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP -- 紀錄最後更新時間
 );
@@ -41,6 +42,7 @@ COMMENT ON COLUMN strategies.entry_criteria IS '進場標準';
 COMMENT ON COLUMN strategies.exit_criteria IS '出場標準';
 COMMENT ON COLUMN strategies.status IS '策略的當前狀態';
 COMMENT ON COLUMN strategies.passphrase IS '用於接收 Trading View 訊號的 UUID';
+COMMENT ON COLUMN strategies.trade_group_id IS '交易群組ID';
 COMMENT ON COLUMN strategies.created_at IS '紀錄創建時間';
 COMMENT ON COLUMN strategies.updated_at IS '紀錄最後更新時間';
 
@@ -55,11 +57,11 @@ CREATE TABLE trades (
     price NUMERIC(10, 2), -- 交易價格
     profit_loss NUMERIC(10, 2) DEFAULT 0, -- 盈虧
     cumulative_profit_loss NUMERIC(10, 2) DEFAULT 0, -- 累計盈虧
+    trade_group_id varchar(36) NULL, -- 交易群組ID
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP, -- 創建時間
     updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP -- 更新時間
 );
 
--- 為 trades 表的各個列添加註釋
 COMMENT ON COLUMN trades.trade_id IS '交易的唯一識別碼';
 COMMENT ON COLUMN trades.thirdparty_id IS '第三方ID，用於存儲大整數';
 COMMENT ON COLUMN trades.strategy_id IS '關聯的策略ID';
@@ -69,6 +71,7 @@ COMMENT ON COLUMN trades.quantity IS '交易數量';
 COMMENT ON COLUMN trades.price IS '交易價格';
 COMMENT ON COLUMN trades.profit_loss IS '盈虧';
 COMMENT ON COLUMN trades.cumulative_profit_loss IS '累計盈虧';
+COMMENT ON COLUMN trades.trade_group_id IS '交易群組ID';
 COMMENT ON COLUMN trades.created_at IS '創建時間';
 COMMENT ON COLUMN trades.updated_at IS '更新時間';
 
