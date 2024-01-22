@@ -28,7 +28,8 @@ from .utils import (
     query_trades_by_group_id,
     calculate_total_realized_pnl,
     update_account_balance,
-    update_trade_profit_loss
+    update_trade_profit_loss,
+    get_monthly_rotating_logger
 )
 
 notification_queue_entry = queue.Queue()
@@ -42,6 +43,8 @@ api_secret = main_account.api_secret
 client = Client(api_key, api_secret)
 tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
 
+logger = get_monthly_rotating_logger('log', '../logs')
+logger.info('start')
 
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
@@ -100,13 +103,13 @@ for symbol_info in exchange_info["symbols"]:
     }
 
 # 打印結果
-print(exchange_info_map)
+logger.info(exchange_info_map)
 # 打印目前策略
 strategy_list()
 
 @api_view(['GET', 'POST'])
 def webhook(request):
-    print("receive notification")
+    logger.info("receive notification")
     plain = request.body.decode('utf-8')
     notification_type = parse_type(plain)
     if notification_type == 'long_exit' or notification_type == 'short_exit':
@@ -140,15 +143,15 @@ def handle_webhook(body_unicode):
     # preserve prev position exists less than
     preserve_prev_position_second = 20
     req_id = wrap_str(str(uuid.uuid1()).split("-")[0])
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'received signal: ', body_unicode)
+    logger.info(f"{req_id} - received signal: {body_unicode}")
     if body_unicode:
         try:
             notification = json.loads(body_unicode)
             strategy = find_strategy_by_passphrase(notification['passphrase'])
             if strategy is not None:
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase correct')
+                logger.info(f"{req_id} - passphrase correct")
                 strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'strategy client', strategy_client)
+                logger.info(f"{req_id} - strategy client {strategy_client}")
                 signal_symbol = notification['ticker']
                 _price_precision = int(exchange_info_map[signal_symbol]['pricePrecision'])
                 _quantity_precision = int(exchange_info_map[signal_symbol]['quantityPrecision'])
@@ -160,7 +163,7 @@ def handle_webhook(body_unicode):
                 signal_message = notification['message']
                 if signal_message is not None:
                     signal_message_json = json.loads(signal_message)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'signal message', signal_message_json)
+                    logger.info(f"{req_id} - signal message {signal_message_json}")
                 if signal_message_json is not None and 'type' in signal_message_json:
                     signal_message_type = signal_message_json['type']
                 if signal_message_json is not None and 'lev' in signal_message_json:
@@ -174,11 +177,11 @@ def handle_webhook(body_unicode):
                 prev_opposite_side = ''
                 allowed_close_position = False
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'check current position')
+                logger.info(f"{req_id} - check current position")
                 time.sleep(close_position_delay)
                 position = get_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol)
                 if position is not None:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'position is not None')
+                    logger.info(f"{req_id} - position is not None")
                     prev_quantity = position['positionAmt']
                     prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
                         '' if float(prev_quantity) == 0.0 else 'BUY')
@@ -186,23 +189,23 @@ def handle_webhook(body_unicode):
                     now = datetime.now()
                     timestamp = datetime.timestamp(now) * 1000
                     # diff seconds
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'current timestamp', timestamp)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'prev timestamp', prev_update_time)
+                    logger.info(f"{req_id} - current timestamp {timestamp}")
+                    logger.info(f"{req_id} - prev timestamp {prev_update_time}")
                     diff = (timestamp - prev_update_time) / 1000
                     allowed_close_position = True if diff > preserve_prev_position_second else False
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'signal_position_size', signal_position_size)
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'allowed_close_position', allowed_close_position)
+                logger.info(f"{req_id} - signal_position_size {signal_position_size}")
+                logger.info(f"{req_id} - allowed_close_position {allowed_close_position}")
 
                 # if signal position == 0, close position
                 # and abs(float(prev_quantity)) > 0  ?
                 if signal_position_size == 0 and allowed_close_position:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close signal')
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order for close signal')
+                    logger.info(f"{req_id} - close signal")
+                    logger.info(f"{req_id} - close prev open order for close signal")
                     cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
+                    logger.info(f"{req_id} - close prev position")
                     close_response = close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'close response', close_response)
+                    logger.info(f"{req_id} - close response {close_response}")
 
                     # 更新Strategy狀態
                     strategy.status = "INACTIVE"
@@ -217,27 +220,27 @@ def handle_webhook(body_unicode):
                     try:
                         send_telegram_message(req_id, post_data)
                     except Exception as e:
-                        print(f"An error occurred while sending Telegram message: {e}")
+                        logger.info(f"{req_id} - An error occurred while sending Telegram message: {e}")
 
                     trade_array = convert_to_trade_array(response=close_response, trade_type_override='EXIT')
                     create_trades_from_binance(binance_trades=trade_array, strategy_id=strategy.strategy_id, trade_group_id=strategy.trade_group_id)
                     order_list = query_trades_by_group_id(strategy.trade_group_id)
 
-                    print('order list', order_list)
+                    logger.info(f"{req_id} - order list {order_list}")
                     # 更新該策略的balace
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'calculate total realized pnl')
+                    logger.info(f"{req_id} - calculate total realized pnl")
                     total_realized_pnl = calculate_total_realized_pnl(
                         client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'total_realized_pnl', total_realized_pnl)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), update_account_balance(total_realized_pnl, strategy.strategy_id))
+                    logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+                    logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
                     # 更新已實現盈虧到出場紀錄
                     update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
+                    logger.info(f"{req_id} - end")
                     return HttpResponse('received')
 
                 # handle exit signal
                 if signal_message_type == 'long_exit' or signal_message_type == 'short_exit':
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'exit: ', signal_message_json['type'])
+                    logger.info(f"{req_id} - exit: {signal_message_json['type']}")
                     post_data = {
                         'symbol': signal_symbol,
                         'side': prev_opposite_side,
@@ -247,7 +250,7 @@ def handle_webhook(body_unicode):
                     send_telegram_message(req_id, post_data)
                     return HttpResponse('received')
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev open order for entry signal')
+                logger.info(f"{req_id} - close prev open order for entry signal")
                 cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
 
                 time.sleep(create_order_delay)
@@ -257,45 +260,45 @@ def handle_webhook(body_unicode):
 
                 if balance is not None:
                     usdt = balance.balance
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'has corresponding balance', usdt)
+                    logger.info(f"{req_id} - has corresponding balance {usdt}")
                     balance.equity = percentage
                     balance.save()
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'update equity %', percentage)
+                    logger.info(f"{req_id} - update equity % {percentage}")
                 else:
                     usdt = strategy.initial_capital
 
                 if usdt > all_usdt:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'exceed all usdt')
+                    logger.info(f"{req_id} - exceed all usdt")
                     usdt = all_usdt
 
                 usdt = str(usdt)
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'used usdt', usdt)
+                logger.info(f"{req_id} - used usdt {usdt}")
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse entry')
+                logger.info(f"{req_id} - parse entry")
                 signal_entry = round(float(notification['entry']), _price_precision)
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse side')
+                logger.info(f"{req_id} - parse side")
                 signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long times')
+                logger.info(f"{req_id} - parse long times")
                 signal_long_times = int(notification['strategy']['long']['times'])
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long stop loss')
+                logger.info(f"{req_id} - parse long stop loss")
                 signal_long_stop_loss = notification['strategy']['long']['stopLoss']
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
+                logger.info(f"{req_id} - parse long take profit")
                 signal_long_take_profit = notification['strategy']['long']['takeProfit']
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short times')
+                logger.info(f"{req_id} - parse short times")
                 signal_short_times = int(notification['strategy']['short']['times'])
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short stop loss')
+                logger.info(f"{req_id} - parse short stop loss")
                 signal_short_stop_loss = notification['strategy']['short']['stopLoss']
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long take profit')
+                logger.info(f"{req_id} - parse long take profit")
                 signal_short_take_profit = notification['strategy']['short']['takeProfit']
                 raw_quantity = 0 if usdt is None else math.floor(100 * float(usdt) * percentage / signal_entry) / 100
 
                 # params override by message
                 if signal_message_type == 'long_entry':
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse long leverage from message')
+                    logger.info(f"{req_id} - parse long leverage from message")
                     signal_long_times = int(signal_message_lev)
                 elif signal_message_type == 'short_entry':
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse short leverage from message')
+                    logger.info(f"{req_id} - parse short leverage from message")
                     signal_short_times = int(signal_message_lev)
 
                 if signal_side == 'BUY':
@@ -306,9 +309,9 @@ def handle_webhook(body_unicode):
                 quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
                                  _quantity_precision)
 
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'raw_quantity', raw_quantity)
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', quantity)
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'signal_position_size', signal_position_size)
+                logger.info(f"{req_id} - raw_quantity {raw_quantity}")
+                logger.info(f"{req_id} - quantity {quantity}")
+                logger.info(f"{req_id} - signal_position_size {signal_position_size}")
 
                 stop_loss_stop_price = round(
                     (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
@@ -316,7 +319,7 @@ def handle_webhook(body_unicode):
 
                 # params override by message
                 if signal_message_json is not None and 'sl' in signal_message_json:
-                    print(req_id, wrap_str(inspect.stack()[0][3]), 'parse stop loss from message')
+                    logger.info(f"{req_id} - parse stop loss from message")
                     stop_loss_stop_price = round(float(signal_message_json['sl']), _price_precision)
 
                 take_profit_stop_price = round(
@@ -349,15 +352,15 @@ def handle_webhook(body_unicode):
                 send_telegram_message(req_id, post_data)
 
             else:
-                print(req_id, wrap_str(inspect.stack()[0][3]), 'passphrase incorrect')
+                logger.info(f"{req_id} - passphrase incorrect")
                 # send telegram msg
                 # requests.get('http://127.0.0.1:5000/telegram')
         except:
-            print(req_id, wrap_str(inspect.stack()[0][3]), "error:", sys.exc_info())
+            logger.info(f"{req_id} - error:", sys.exc_info())
     else:
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'empty')
+        logger.info(f"{req_id} - empty")
 
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'end')
+    logger.info(f"{req_id} - end")
     return HttpResponse('received')
 
 
@@ -365,17 +368,17 @@ def send_telegram_message(req_id, post_data):
     if not check_api_enable(enable_send_telegram):
         return None
 
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'send telegram message')
+    logger.info(f"{req_id} - send telegram message")
     response = requests.post('http://127.0.0.1:5000/telegram', json=post_data)
     content = response.content
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'content', content)
+    logger.info(f"{req_id} - content {content}")
 
 
 def change_leverage(req_id, strategy_client, symbol, leverage):
     if not check_api_enable(enable_change_leverage):
         return None
 
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'change leverage', symbol, leverage)
+    logger.info(f"{req_id} - change leverage, {symbol}, {leverage}")
     strategy_client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
 
@@ -388,7 +391,7 @@ def get_usdt(req_id, strategy_client):
     for balance in balances:
         if balance['asset'] == 'USDT':
             withdraw_available_usdt = balance['availableBalance']
-    print(req_id, wrap_str(inspect.stack()[0][3]), withdraw_available_usdt)
+    logger.info(f"{req_id} - {withdraw_available_usdt}")
     return withdraw_available_usdt
 
 
@@ -403,18 +406,17 @@ def get_position(req_id, strategy_client, symbol):
     if not check_api_enable(enable_get_position):
         return None
 
-    print(req_id, wrap_str(inspect.stack()[0][3]))
+    logger.info(f"{req_id} - start get position")
     positions = strategy_client.futures_account()['positions']
     target = None
     for position in positions:
         if position['symbol'] == symbol:
             target = position
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'position', position)
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'has initial margin', float(position['initialMargin']) > 0)
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'leverage', position['leverage'])
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity', position['positionAmt'])
-            print(req_id, wrap_str(inspect.stack()[0][3]), 'opposite_side',
-                  'SELL' if float(position['positionAmt']) > 0 else 'BUY')
+            logger.info(f"{req_id} - position {position}")
+            logger.info(f"{req_id} - has initial margin {float(position['initialMargin']) > 0}")
+            logger.info(f"{req_id} - leverage {position['leverage']}")
+            logger.info(f"{req_id} - quantity', {position['positionAmt']}")
+            logger.info(f"{req_id} - opposite_side' {'SELL' if float(position['positionAmt']) > 0 else 'BUY'}")
             return target
     return None
 
@@ -426,11 +428,11 @@ def close_position(req_id, strategy_client, symbol, side, quantity):
     if side == '':
         return
     _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
-    print(req_id, wrap_str(inspect.stack()[0][3]), symbol, side, round(float(quantity), _quantity_precision))
+    logger.info(f"{req_id} - {symbol}, {side}, {round(float(quantity), _quantity_precision)}")
     # cancel_order_response = client.futures_cancel_all_open_orders(symbol=symbol)
     # print('cancel_order_response', cancel_order_response)
     if abs(float(quantity)) != 0.0:
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
+        logger.info(f"{req_id} - has position")
         response = strategy_client.futures_create_order(
             symbol=symbol,
             type="MARKET",
@@ -438,10 +440,10 @@ def close_position(req_id, strategy_client, symbol, side, quantity):
             quantity=round(abs(float(quantity)), _quantity_precision),
             reduceOnly='True'
         )
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'succ', response)
+        logger.info(f"{req_id} - succ', {response}")
         return response
     else:
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'no position')
+        logger.info(f"{req_id} - no position")
 
 
 def close_position_at_price(req_id, strategy_client, symbol, side, stop_price):
@@ -456,7 +458,7 @@ def close_position_at_price(req_id, strategy_client, symbol, side, stop_price):
         closePosition='True',
         stopPrice=stop_price
     )
-    print(req_id, wrap_str(inspect.stack()[0][3]), response)
+    logger.info(f"{req_id} - {response}")
 
 
 def create_order(
@@ -473,20 +475,20 @@ def create_order(
         stop_loss_stop_price,
         take_profit_stop_price
 ):
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'create_order', symbol, side, quantity, entry)
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'close prev position')
+    logger.info(f"{req_id} - create_order, {symbol}, {side}, {quantity}, {entry}")
+    logger.info(f"{req_id} - close prev position")
     if abs(float(prev_quantity)) > 0.0:
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'has position')
+        logger.info(f"{req_id} - has position")
         close_position(req_id=req_id, symbol=symbol, side=prev_opposite_side, quantity=prev_quantity)
     _price_precision = int(exchange_info_map[symbol]['pricePrecision'])
     _quantity_precision = int(exchange_info_map[symbol]['quantityPrecision'])
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'quantity precision', _quantity_precision)
+    logger.info(f"{req_id} - quantity precision {_quantity_precision}")
     if (format_decimal(quantity, _quantity_precision)) == 0:
-        print(req_id, wrap_str(inspect.stack()[0][3]), 'Unable to open a position: the quantity becomes 0 after precision adjustment')
+        logger.info(f"{req_id} - Unable to open a position: the quantity becomes 0 after precision adjustment")
 
     # 建立trade_group_id
     trade_group_id = uuid.uuid4()
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'trade_group_id ', trade_group_id)
+    logger.info(f"{req_id} - trade_group_id {trade_group_id}")
 
     # 先計算前三個止盈點的訂單量
     quantity_level1 = format_decimal(quantity * (1 / 11), _quantity_precision)  # 1/(1+2+3+5) 的倉位大小
@@ -548,7 +550,7 @@ def create_order(
         }
     ]
 
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'batch order 1', json.dumps(batch_payload), '\r\n')
+    logger.info(f"{req_id} - batch order 1', {json.dumps(batch_payload)}")
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
@@ -557,13 +559,13 @@ def create_order(
         strategy.status = "ACTIVE"
         strategy.trade_group_id = trade_group_id
         strategy.save()
-        print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 1", response)
+        logger.info(f"{req_id} - create_order response 1 {response}")
 
     time.sleep(2)
 
     if float(format_decimal(float(quantity_level1), _quantity_precision)) == 0:
         quantity_message = f"Unable to open a position: the quantity becomes 0 after precision adjustment"
-        print(req_id, wrap_str(inspect.stack()[0][3]), quantity_message)
+        logger.info(f"{req_id} - {quantity_message}")
         return
 
     # 構造訂單 2
@@ -603,12 +605,12 @@ def create_order(
         }
     ]
 
-    print(req_id, wrap_str(inspect.stack()[0][3]), 'batch order 2', json.dumps(batch_payload), '\r\n')
+    logger.info(f"{req_id} - batch order 2, {json.dumps(batch_payload)}")
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
         create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id, trade_group_id=trade_group_id)
-        print(req_id, wrap_str(inspect.stack()[0][3]), "create_order response 2", response)
+        logger.info(f"{req_id} - create_order response 2 {response}")
 
 
 ##############

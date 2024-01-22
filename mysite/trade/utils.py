@@ -1,6 +1,37 @@
+import os
 from decimal import Decimal
-
 from .models import AccountInfo, Strategy, AccountBalance, Trade
+import logging
+from logging.handlers import TimedRotatingFileHandler
+import datetime
+
+
+def get_monthly_rotating_logger(logger_name, log_dir='logs'):
+    logger = logging.getLogger(logger_name)
+
+    # 检查是否已经添加了处理器
+    if not logger.handlers:
+        print("logger not found")
+        logger.setLevel(logging.INFO)
+
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+        current_month = datetime.datetime.now().strftime("%Y-%m")
+        log_filename = f'{log_dir}/my_trade_system_{current_month}.log'
+
+        handler = TimedRotatingFileHandler(log_filename, when='MIDNIGHT', interval=1, backupCount=0)
+        handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] [%(funcName)s] [%(lineno)d] - %(message)s'))
+
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] [%(funcName)s] [%(lineno)d] - %(message)s'))
+
+        logger.addHandler(handler)
+        logger.addHandler(console_handler)
+    else:
+        print('logger found ')
+
+    return logger
 
 
 def format_decimal(value, digit):
