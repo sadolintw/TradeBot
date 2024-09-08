@@ -29,7 +29,12 @@ from .utils import (
     calculate_total_realized_pnl,
     update_account_balance,
     update_trade_profit_loss,
-    get_monthly_rotating_logger
+    get_monthly_rotating_logger,
+    get_grid_position,
+    create_new_grid_position,
+    query_trade,
+    get_total_quantity_for_strategy,
+    close_positions_for_strategy
 )
 
 notification_queue_entry = queue.Queue()
@@ -45,6 +50,7 @@ tradingview_passphase = os.environ['TRADINGVIEW_PASSPHASE']
 
 logger = get_monthly_rotating_logger('log', '../logs')
 logger.info('start')
+
 
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
@@ -65,6 +71,15 @@ enable_create_order = True
 enable_send_telegram = True
 
 exchange_info_map = {}
+
+# body_unicode = request.body.decode('utf-8')
+close_position_delay = 2
+create_order_delay = 2
+get_account_trade_delay = 2
+percentage = 0.95
+# preserve prev position exists less than
+preserve_prev_position_second = 20
+
 
 def parse_type(notification):
     notification_json = json.loads(notification)
@@ -107,14 +122,20 @@ logger.info(exchange_info_map)
 # 打印目前策略
 strategy_list()
 
+
 @api_view(['GET', 'POST'])
 def webhook(request):
     logger.info("receive notification")
     plain = request.body.decode('utf-8')
     notification_type = parse_type(plain)
-    if notification_type == 'long_exit' or notification_type == 'short_exit':
+    if notification_type == 'long_exit' or \
+            notification_type == 'short_exit' or \
+            notification_type == 'exit' or \
+            notification_type == 'close_all':
         notification_queue_exit.put(plain)
-    if notification_type == 'long_entry' or notification_type == 'short_entry':
+    if notification_type == 'long_entry' or \
+            notification_type == 'short_entry' or \
+            notification_type == 'entry':
         notification_queue_entry.put(plain)
     return HttpResponse('received')
 
@@ -136,12 +157,6 @@ def handle_webhook_exit_schedule():
 
 
 def handle_webhook(body_unicode):
-    # body_unicode = request.body.decode('utf-8')
-    close_position_delay = 2
-    create_order_delay = 2
-    percentage = 0.95
-    # preserve prev position exists less than
-    preserve_prev_position_second = 20
     req_id = wrap_str(str(uuid.uuid1()).split("-")[0])
     logger.info(f"{req_id} - received signal: {body_unicode}")
     if body_unicode:
@@ -150,206 +165,17 @@ def handle_webhook(body_unicode):
             strategy = find_strategy_by_passphrase(notification['passphrase'])
             if strategy is not None:
                 logger.info(f"{req_id} - passphrase correct")
-                strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
-                logger.info(f"{req_id} - strategy client {strategy_client}")
-                signal_symbol = notification['ticker']
-                _price_precision = int(exchange_info_map[signal_symbol]['pricePrecision'])
-                _quantity_precision = int(exchange_info_map[signal_symbol]['quantityPrecision'])
-                signal_position_size = round(float(notification['position_size']), _quantity_precision)
-                signal_message_json = None
-                signal_message_type = None
-                signal_message_lev = None
-                signal_message_eq = None
-                signal_message = notification['message']
-                if signal_message is not None:
-                    signal_message_json = json.loads(signal_message)
-                    logger.info(f"{req_id} - signal message {signal_message_json}")
-                if signal_message_json is not None and 'type' in signal_message_json:
-                    signal_message_type = signal_message_json['type']
-                if signal_message_json is not None and 'lev' in signal_message_json:
-                    signal_message_lev = signal_message_json['lev']
-                if signal_message_json is not None and 'eq' in signal_message_json:
-                    signal_message_eq = int(float(signal_message_json['eq']))
-                    if signal_message_eq > 95:
-                        signal_message_eq = 95
-                    percentage = signal_message_eq / 100
-                prev_quantity = 0
-                prev_opposite_side = ''
-                allowed_close_position = False
-
-                logger.info(f"{req_id} - check current position")
-                time.sleep(close_position_delay)
-                position = get_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol)
-                if position is not None:
-                    logger.info(f"{req_id} - position is not None")
-                    prev_quantity = position['positionAmt']
-                    prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
-                        '' if float(prev_quantity) == 0.0 else 'BUY')
-                    prev_update_time = int(position['updateTime'])
-                    now = datetime.now()
-                    timestamp = datetime.timestamp(now) * 1000
-                    # diff seconds
-                    logger.info(f"{req_id} - current timestamp {timestamp}")
-                    logger.info(f"{req_id} - prev timestamp {prev_update_time}")
-                    diff = (timestamp - prev_update_time) / 1000
-                    allowed_close_position = True if diff > preserve_prev_position_second else False
-
-                logger.info(f"{req_id} - signal_position_size {signal_position_size}")
-                logger.info(f"{req_id} - allowed_close_position {allowed_close_position}")
-
-                # if signal position == 0, close position
-                # and abs(float(prev_quantity)) > 0  ?
-                if signal_position_size == 0 and allowed_close_position:
-                    logger.info(f"{req_id} - close signal")
-                    logger.info(f"{req_id} - close prev open order for close signal")
-                    cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
-                    logger.info(f"{req_id} - close prev position")
-                    close_response = close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol, side=prev_opposite_side, quantity=prev_quantity)
-                    logger.info(f"{req_id} - close response {close_response}")
-
-                    # 更新Strategy狀態
-                    strategy.status = "INACTIVE"
-                    strategy.save()
-
-                    post_data = {
-                        'symbol': signal_symbol,
-                        'side': prev_opposite_side,
-                        'type': signal_message_type,
-                        'msg': 'close prev position'
-                    }
-                    try:
-                        send_telegram_message(req_id, post_data)
-                    except Exception as e:
-                        logger.info(f"{req_id} - An error occurred while sending Telegram message: {e}")
-
-                    trade_array = convert_to_trade_array(response=close_response, trade_type_override='EXIT')
-                    create_trades_from_binance(binance_trades=trade_array, strategy_id=strategy.strategy_id, trade_group_id=strategy.trade_group_id)
-                    order_list = query_trades_by_group_id(strategy.trade_group_id)
-
-                    logger.info(f"{req_id} - order list {order_list}")
-                    # 更新該策略的balace
-                    logger.info(f"{req_id} - calculate total realized pnl")
-                    total_realized_pnl = calculate_total_realized_pnl(
-                        client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
-                    logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
-                    logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
-                    # 更新已實現盈虧到出場紀錄
-                    update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
-                    logger.info(f"{req_id} - end")
-                    return HttpResponse('received')
-
-                # handle exit signal
-                if signal_message_type == 'long_exit' or signal_message_type == 'short_exit':
-                    logger.info(f"{req_id} - exit: {signal_message_json['type']}")
-                    post_data = {
-                        'symbol': signal_symbol,
-                        'side': prev_opposite_side,
-                        'type': signal_message_type,
-                        'msg': 'close prev position'
-                    }
-                    send_telegram_message(req_id, post_data)
-                    return HttpResponse('received')
-
-                logger.info(f"{req_id} - close prev open order for entry signal")
-                cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
-
-                time.sleep(create_order_delay)
-                # prepare param
-                all_usdt = Decimal(get_usdt(req_id=req_id, strategy_client=strategy_client))
-                balance = find_balance_by_strategy_id(strategy.strategy_id)
-
-                if balance is not None:
-                    usdt = balance.balance
-                    logger.info(f"{req_id} - has corresponding balance {usdt}")
-                    balance.equity = percentage
-                    balance.save()
-                    logger.info(f"{req_id} - update equity % {percentage}")
+                # 檢查notification中是否存在'type'字段，並判斷其值
+                if 'type' in notification:
+                    if notification['type'] == 'grid':
+                        # 如果type為'grid'，則處理網格交易通知
+                        handle_grid_notification(req_id, strategy, notification)
+                    elif notification['type'] == 'swing':
+                        # 如果type為'swing'，則處理波段交易通知
+                        handle_swing_notification(req_id, strategy, notification)
                 else:
-                    usdt = strategy.initial_capital
-
-                if usdt > all_usdt:
-                    logger.info(f"{req_id} - exceed all usdt")
-                    usdt = all_usdt
-
-                usdt = str(usdt)
-
-                logger.info(f"{req_id} - used usdt {usdt}")
-
-                logger.info(f"{req_id} - parse entry")
-                signal_entry = round(float(notification['entry']), _price_precision)
-                logger.info(f"{req_id} - parse side")
-                signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
-                logger.info(f"{req_id} - parse long times")
-                signal_long_times = int(notification['strategy']['long']['times'])
-                logger.info(f"{req_id} - parse long stop loss")
-                signal_long_stop_loss = notification['strategy']['long']['stopLoss']
-                logger.info(f"{req_id} - parse long take profit")
-                signal_long_take_profit = notification['strategy']['long']['takeProfit']
-                logger.info(f"{req_id} - parse short times")
-                signal_short_times = int(notification['strategy']['short']['times'])
-                logger.info(f"{req_id} - parse short stop loss")
-                signal_short_stop_loss = notification['strategy']['short']['stopLoss']
-                logger.info(f"{req_id} - parse long take profit")
-                signal_short_take_profit = notification['strategy']['short']['takeProfit']
-                raw_quantity = 0 if usdt is None else math.floor(100 * float(usdt) * percentage / signal_entry) / 100
-
-                # params override by message
-                if signal_message_type == 'long_entry':
-                    logger.info(f"{req_id} - parse long leverage from message")
-                    signal_long_times = int(signal_message_lev)
-                elif signal_message_type == 'short_entry':
-                    logger.info(f"{req_id} - parse short leverage from message")
-                    signal_short_times = int(signal_message_lev)
-
-                if signal_side == 'BUY':
-                    change_leverage(req_id, strategy_client, signal_symbol, signal_long_times)
-                else:
-                    change_leverage(req_id, strategy_client, signal_symbol, signal_short_times)
-
-                quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
-                                 _quantity_precision)
-
-                logger.info(f"{req_id} - raw_quantity {raw_quantity}")
-                logger.info(f"{req_id} - quantity {quantity}")
-                logger.info(f"{req_id} - signal_position_size {signal_position_size}")
-
-                stop_loss_stop_price = round(
-                    (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
-                            float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), _price_precision)
-
-                # params override by message
-                if signal_message_json is not None and 'sl' in signal_message_json:
-                    logger.info(f"{req_id} - parse stop loss from message")
-                    stop_loss_stop_price = round(float(signal_message_json['sl']), _price_precision)
-
-                take_profit_stop_price = round(
-                    (float(signal_entry) * (100 + float(signal_long_take_profit)) / 100) if signal_side == 'BUY' else (
-                            float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), _price_precision)
-
-                create_order(
-                    req_id,
-                    strategy_client,
-                    strategy,
-                    signal_symbol,
-                    signal_side,
-                    quantity,
-                    prev_quantity,
-                    prev_opposite_side,
-                    signal_entry,
-                    'SELL' if signal_side == 'BUY' else 'BUY',
-                    stop_loss_stop_price,
-                    take_profit_stop_price
-                )
-
-                # entry exit
-                post_data = {
-                    'symbol': signal_symbol,
-                    'entry': signal_entry,
-                    'side': signal_side,
-                    'type': signal_message_type,
-                    'msg': 'create order'
-                }
-                send_telegram_message(req_id, post_data)
+                    # 如果notification中不存在'type'字段，可以考慮記錄錯誤、拋出異常或者默認處理
+                    logger.info(f"{req_id} - Notification type is missing or invalid.")
 
             else:
                 logger.info(f"{req_id} - passphrase incorrect")
@@ -362,6 +188,830 @@ def handle_webhook(body_unicode):
 
     logger.info(f"{req_id} - end")
     return HttpResponse('received')
+
+
+def handle_grid_notification(req_id, strategy, notification):
+    notification_message = json.loads(notification.get("message", {}))
+    grids = int(notification_message.get("grids", 0))
+    grid_index = int(notification_message.get("gridIndex", 0))  # 从通知中获取格子索引，缺省值为0
+    leverage = int(notification_message.get("leverage", 1))  # 从通知中获取杠杆数，缺省值为1
+    weight = int(notification_message.get("weight",1))
+    total_weight = int(notification_message.get("totalWeight",10))
+    notification_type = notification_message.get("type", "entry")  # 从通知中获取类型，缺省值为"entry"
+    notification_symbol = notification.get("ticker")
+    notification_entry = notification.get("entry")
+
+    if not notification_symbol or not notification_entry:
+        logger.info(f"{req_id} - Field not found in notification. {notification}")
+        return
+    if notification_type == "entry":
+        # 处理开仓逻辑
+        logger.info(
+            f"{req_id} - Handling grid entry for strategy {strategy.strategy_id} on grid {grid_index} with leverage {leverage}")
+        open_grid_position(
+            req_id=req_id,
+            strategy=strategy,
+            grids=grids,
+            grid_index=grid_index,
+            leverage=leverage,
+            weight=weight,
+            total_weight=total_weight,
+            notification_symbol=notification_symbol,
+            notification_entry=notification_entry
+        )
+    elif notification_type == "exit":
+        # 处理平仓逻辑
+        logger.info(f"{req_id} - Handling grid exit for strategy {strategy.strategy_id} on grid {grid_index}")
+        close_grid_position(
+            req_id=req_id,
+            strategy=strategy,
+            grid_index=grid_index,
+            notification_symbol=notification_symbol
+        )
+    elif notification_type == "close_all":
+        # 处理關閉倉位邏輯
+        logger.info(f"{req_id} - Handling close for strategy {strategy.strategy_id}")
+        close_all_position(
+            req_id=req_id,
+            strategy=strategy,
+            notification_symbol=notification_symbol
+        )
+    else:
+        # 未知的通知类型
+        logger.error(f"{req_id} - Unknown notification type {notification_type} for strategy {strategy.strategy_id}")
+
+
+def open_grid_position(
+        req_id,
+        strategy,
+        grids,
+        grid_index,
+        leverage,
+        weight,
+        total_weight,
+        notification_symbol,
+        notification_entry
+):
+    """
+    根据策略、网格索引和杠杆信息开仓。
+
+    参数:
+    - strategy: 策略实例
+    - grid_index: 网格索引
+    - leverage: 杠杆
+    """
+    try:
+        strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+        logger.info(f"{req_id} - strategy client {strategy_client}")
+        symbol_exchange_info = exchange_info_map[notification_symbol]
+        _price_precision = int(symbol_exchange_info['pricePrecision'])
+        _quantity_precision = int(symbol_exchange_info['quantityPrecision'])
+        grid_position = get_grid_position(
+            strategy=strategy,
+            grid_index=grid_index
+        )
+        change_leverage(req_id, strategy_client, notification_symbol, leverage)
+        balance = find_balance_by_strategy_id(strategy.strategy_id)
+        if balance is not None:
+            usdt = balance.balance
+            logger.info(f"{req_id} - has corresponding balance {usdt}")
+        else:
+            usdt = strategy.initial_capital
+
+        usdt = str(usdt)
+        raw_quantity = 0 if usdt is None else math.floor(
+            100000 * float(usdt) * int(weight) / int(total_weight) / float(notification_entry)) / 100000
+        quantity = round(raw_quantity * int(leverage), _quantity_precision)
+        logger.info(f"{req_id} - raw_quantity {raw_quantity}")
+        logger.info(f"{req_id} - quantity {quantity} quantity_precision {_quantity_precision}")
+
+        if grid_position:
+            logger.info(
+                f"{req_id} - grid entry：strategy ID {strategy.strategy_id}, grid_index {grid_index} exist, leverage {leverage}")
+            if grid_position.is_open:
+                logger.info(f"{req_id} - grid_index already open")
+                return
+
+        else:
+            logger.info(
+                f"{req_id} - grid entry：strategy ID {strategy.strategy_id}, grid_index {grid_index} not exist, leverage {leverage}")
+            grid_position = create_new_grid_position(strategy=strategy, grid_index=grid_index)
+
+        # 建立trade_group_id
+        trade_group_id = uuid.uuid4()
+        # 目前沒有設止盈止損 靠訊號關單
+        create_grid_order(
+            req_id=req_id,
+            strategy_client=strategy_client,
+            strategy=strategy,
+            notification_symbol=notification_symbol,
+            side_to_open="BUY",
+            quantity_to_open=quantity,
+            entry=notification_entry,
+            trade_group_id=trade_group_id
+        )
+        grid_position.quantity = quantity
+        grid_position.entry_price = notification_entry
+        grid_position.is_open = True
+        grid_position.trade_group_id = trade_group_id
+        grid_position.save()
+
+        post_data = {
+            'symbol': notification_symbol,
+            'entry': notification_entry,
+            'side': "BUY",
+            'type': "Grid Long Entry",
+            'msg': 'create order'
+        }
+        send_telegram_message(req_id, post_data)
+
+    except Exception as e:
+        # 处理可能发生的其他异常
+        logger.error(f"{req_id} - error：{e}")
+
+
+def close_grid_position(
+        req_id,
+        strategy,
+        grid_index,
+        notification_symbol
+):
+    """
+    根据策略和网格索引关闭网格位置。
+
+    参数:
+    - req_id: 請求id
+    - strategy: 策略实例
+    - grid_index: 网格索引
+    - notification_symbol: 通知裡的幣種
+    """
+    try:
+        strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+        # 查找所有对应的且当前为开仓状态的GridPosition记录
+        grid_position_to_close = get_grid_position(
+            strategy=strategy,
+            grid_index=grid_index
+        )
+
+        if grid_position_to_close:
+            logger.info(
+                f"{req_id} - grid entry：strategy ID {strategy.strategy_id}, grid_index {grid_index} exist")
+            if not grid_position_to_close.is_open:
+                logger.info(f"{req_id} - grid_index already close")
+                return
+        else:
+            logger.info(f"{req_id} - symbol {notification_symbol} grid_index not found")
+            return
+
+        position = get_position(req_id=req_id, strategy_client=strategy_client, symbol=notification_symbol)
+        close_grid_order(
+            req_id=req_id,
+            strategy_client=strategy_client,
+            strategy=strategy,
+            side_to_close="SELL",
+            position_info=position,
+            grid_position=grid_position_to_close,
+            notification_symbol=notification_symbol
+        )
+        ###
+        grid_exit_trade = query_trade(trade_group_id=grid_position_to_close.trade_group_id, trade_type="GRID_EXIT")
+        order_list = []
+        if grid_exit_trade is not None:
+            order_list.append(grid_exit_trade.thirdparty_id)
+        else:
+            logger.info(f"{req_id} - not grid exit record")
+            return
+
+        # 更新該策略的balace
+        logger.info(f"{req_id} - order list {order_list}")
+        start_time = str((grid_exit_trade.created_at_timestamp - 3600) * 1000)
+        logger.info(f"{req_id} - start_time {start_time}")
+        time.sleep(get_account_trade_delay)
+        account_trade_res = client.futures_account_trades(symbol=notification_symbol, limit=300, startTime=start_time)
+        logger.info(f"{req_id} - account_trade_res {account_trade_res}")
+        total_realized_pnl = calculate_total_realized_pnl(account_trade_res, order_list)
+        logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+        logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
+        # 更新已實現盈虧到出場紀錄
+        update_trade_profit_loss(
+            trade_group_id=strategy.trade_group_id,
+            total_realized_pnl=total_realized_pnl,
+            trade_type="GRID_EXIT"
+        )
+        # 關閉網格倉位
+        grid_position_to_close.is_open = False
+        grid_position_to_close.save()
+        # 更新出場盈虧
+        grid_exit_trade.profit_loss = total_realized_pnl
+        grid_exit_trade.save()
+
+    except Exception as e:
+        # 处理可能发生的其他异常
+        logger.error(f"{req_id} - error：{e}")
+
+
+# TODO
+def close_all_position(
+        req_id,
+        strategy,
+        notification_symbol
+):
+    """
+    根据策略和网格索引关闭网格位置。
+
+    参数:
+    - req_id: 請求id
+    - strategy: 策略实例
+    - notification_symbol: 通知裡的幣種
+    """
+    try:
+        strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+        # 查找所有对应的且当前为开仓状态的GridPosition记录
+        grid_quantity_to_close = get_total_quantity_for_strategy(
+            strategy=strategy
+        )
+
+        close_positions_for_strategy(strategy=strategy)
+        logger.info("test")
+        # 构造平仓订单
+        order_payload = [
+            # 市價出場
+            {
+                'symbol': notification_symbol,
+                'type': 'MARKET',
+                'quantity': format_decimal(grid_quantity_to_close,
+                                           int(exchange_info_map[notification_symbol]['quantityPrecision'])),
+                'side': "SELL",
+                'reduceOnly': 'true'
+            }
+        ]
+        logger.info(order_payload)
+        logger.info(f"{req_id} - Closing order: {json.dumps(order_payload)}")
+        if check_api_enable(enable_create_order):
+            response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(order_payload))
+            # 創建Trade實例
+            # create_trades_from_binance(
+            #     binance_trades=response,
+            #     strategy_id=strategy.strategy_id,
+            #     trade_group_id=trade_group_id,
+            #     trade_type_override="GRID_EXIT"
+            # )
+            # TODO 判斷是否全部平掉 是的話更新INACTIVE
+            # 记录平仓操作
+            logger.info(f"{req_id} - Close order response: {response}")
+
+    except Exception as e:
+        # 处理可能发生的其他异常
+        logger.error(f"{req_id} - error：{e}")
+
+
+###
+
+
+def handle_notification_common(req_id, strategy, notification, position):
+    logger.info(f"{req_id} - check current position")
+    time.sleep(close_position_delay)
+    if position is not None:
+        return handle_existing_position(req_id, strategy, notification, position)
+    else:
+        return False
+
+
+def handle_existing_position(
+        req_id,
+        strategy,
+        notification,
+        position,
+        symbol_exchange_info,
+        strategy_client,
+        signal_symbol,
+        signal_message_type
+):
+    logger.info(f"{req_id} - position is not None")
+    prev_quantity = position['positionAmt']
+    _price_precision = int(symbol_exchange_info['pricePrecision'])
+    _quantity_precision = int(symbol_exchange_info['quantityPrecision'])
+    signal_position_size = round(float(notification['position_size']), _quantity_precision)
+    prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
+        '' if float(prev_quantity) == 0.0 else 'BUY')
+    prev_update_time = int(position['updateTime'])
+    now = datetime.now()
+    timestamp = datetime.timestamp(now) * 1000
+    # diff seconds
+    logger.info(f"{req_id} - current timestamp {timestamp}")
+    logger.info(f"{req_id} - prev timestamp {prev_update_time}")
+    diff = (timestamp - prev_update_time) / 1000
+    # 幣安的掛單先止盈可能也會是False
+    allowed_close_position = True if diff > preserve_prev_position_second else False
+
+    logger.info(f"{req_id} - signal_position_size {signal_position_size}")
+    logger.info(f"{req_id} - allowed_close_position {allowed_close_position}")
+
+    if signal_position_size == 0 and allowed_close_position:
+        logger.info(f"{req_id} - close signal")
+        logger.info(f"{req_id} - close prev open order for close signal")
+        cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
+        logger.info(f"{req_id} - close prev position")
+        close_response = close_position(
+            req_id=req_id,
+            strategy_client=strategy_client,
+            symbol=signal_symbol,
+            side=prev_opposite_side,
+            quantity=prev_quantity
+        )
+        logger.info(f"{req_id} - close response {close_response}")
+
+        # 更新Strategy狀態
+        strategy.status = "INACTIVE"
+        strategy.save()
+
+        post_data = {
+            'symbol': signal_symbol,
+            'side': prev_opposite_side,
+            'type': signal_message_type,
+            'msg': 'close prev position'
+        }
+        try:
+            send_telegram_message(req_id, post_data)
+        except Exception as e:
+            logger.info(f"{req_id} - An error occurred while sending Telegram message: {e}")
+
+        trade_array = convert_to_trade_array(response=close_response, trade_type_override='EXIT', symbol=signal_symbol)
+        create_trades_from_binance(
+            binance_trades=trade_array,
+            strategy_id=strategy.strategy_id,
+            trade_group_id=strategy.trade_group_id
+        )
+        order_list = query_trades_by_group_id(strategy.trade_group_id)
+        # 更新該策略的balance
+        logger.info(f"{req_id} - order list {order_list}")
+        total_realized_pnl = calculate_total_realized_pnl(
+            client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
+        logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+        logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
+        # 更新已實現盈虧到出場紀錄
+        update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
+        return True
+    else:
+        return False
+
+
+# TODO refactor
+def handle_swing_notification2(req_id, strategy, notification):
+    strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+    logger.info(f"{req_id} - strategy client {strategy_client}")
+    signal_symbol = notification['ticker']
+    symbol_exchange_info = exchange_info_map[signal_symbol]
+    _price_precision = int(symbol_exchange_info['pricePrecision'])
+    _quantity_precision = int(symbol_exchange_info['quantityPrecision'])
+
+    logger.info(f"{req_id} - check current position")
+    time.sleep(close_position_delay)
+    position = get_position(
+        req_id=req_id,
+        strategy_client=strategy_client,
+        symbol=signal_symbol
+    )
+    prev_quantity = position['positionAmt']
+    prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
+        '' if float(prev_quantity) == 0.0 else 'BUY')
+    signal_symbol = notification['ticker']
+    signal_message_json = json.loads(notification['message']) if notification.get('message') else None
+    logger.info(f"{req_id} - signal message {signal_message_json}") if signal_message_json else None
+
+    signal_message_type = signal_message_json['type'] if signal_message_json and 'type' in signal_message_json else None
+    signal_message_lev = signal_message_json['lev'] if signal_message_json and 'lev' in signal_message_json else None
+
+    signal_message_eq = int(
+        float(signal_message_json['eq'])) if signal_message_json and 'eq' in signal_message_json else 0
+    signal_message_eq = 95 if signal_message_eq > 95 else signal_message_eq
+    equity_percentage = signal_message_eq / 100
+    signal_position_size = round(float(notification['position_size']), _quantity_precision)
+    is_close_notification = handle_notification_common(
+        req_id=req_id,
+        strategy=strategy,
+        notification=notification,
+        position=position,
+        symbol_exchange_info=symbol_exchange_info,
+        strategy_client=strategy_client,
+        signal_symbol=signal_symbol,
+        signal_message_type=signal_message_type
+    )
+
+    if is_close_notification:
+        return
+
+    # 根据信号类型处理订单创建和关闭
+    signal_message_type = signal_message_json.get('type') if signal_message_json else None
+    if signal_message_type in ['long_entry', 'short_entry']:
+        create_order_based_on_notification(
+            req_id=req_id,
+            strategy=strategy,
+            notification=notification,
+            signal_message_json=signal_message_json,
+            strategy_client=strategy_client,
+            signal_symbol=signal_symbol,
+            signal_message_type=signal_message_type,
+            signal_message_lev=signal_message_lev,
+            symbol_exchange_info=symbol_exchange_info,
+            signal_position_size=signal_position_size,
+            equity_percentage=equity_percentage,
+            prev_quantity=prev_quantity,
+            prev_opposite_side=prev_opposite_side
+        )
+    elif signal_message_type in ['long_exit', 'short_exit']:
+        close_order_based_on_notification(
+            req_id=req_id,
+            strategy=strategy,
+            signal_message_json=signal_message_json,
+            signal_symbol=signal_symbol,
+            prev_opposite_side=prev_opposite_side,
+            signal_message_type=signal_message_type
+        )
+
+
+def create_order_based_on_notification(
+        req_id,
+        strategy,
+        notification,
+        signal_message_json,
+        strategy_client,
+        signal_symbol,
+        signal_message_type,
+        signal_message_lev,
+        symbol_exchange_info,
+        signal_position_size,
+        equity_percentage,
+        prev_quantity,
+        prev_opposite_side
+):
+    logger.info(f"{req_id} - close prev open order for entry signal")
+    cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
+    _price_precision = int(symbol_exchange_info['pricePrecision'])
+    _quantity_precision = int(symbol_exchange_info['quantityPrecision'])
+    time.sleep(create_order_delay)
+    # prepare param
+    all_usdt = Decimal(get_usdt(req_id=req_id, strategy_client=strategy_client))
+    balance = find_balance_by_strategy_id(strategy.strategy_id)
+    if balance is not None:
+        usdt = balance.balance
+        logger.info(f"{req_id} - has corresponding balance {usdt}")
+        balance.equity = equity_percentage
+        balance.save()
+        logger.info(f"{req_id} - update equity % {equity_percentage}")
+    else:
+        usdt = strategy.initial_capital
+
+    if usdt > all_usdt:
+        logger.info(f"{req_id} - exceed all usdt")
+        usdt = all_usdt
+
+    usdt = str(usdt)
+
+    logger.info(f"{req_id} - used usdt {usdt}")
+
+    logger.info(f"{req_id} - parse entry")
+    signal_entry = round(float(notification['entry']), _price_precision)
+    logger.info(f"{req_id} - parse side")
+    signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
+    logger.info(f"{req_id} - parse long times")
+    signal_long_times = int(notification['strategy']['long']['times'])
+    logger.info(f"{req_id} - parse long stop loss")
+    signal_long_stop_loss = notification['strategy']['long']['stopLoss']
+    logger.info(f"{req_id} - parse long take profit")
+    signal_long_take_profit = notification['strategy']['long']['takeProfit']
+    logger.info(f"{req_id} - parse short times")
+    signal_short_times = int(notification['strategy']['short']['times'])
+    logger.info(f"{req_id} - parse short stop loss")
+    signal_short_stop_loss = notification['strategy']['short']['stopLoss']
+    logger.info(f"{req_id} - parse long take profit")
+    signal_short_take_profit = notification['strategy']['short']['takeProfit']
+    raw_quantity = 0 if usdt is None else math.floor(100000 * float(usdt) * equity_percentage / signal_entry) / 100000
+
+    # params override by message
+    if signal_message_type == 'long_entry':
+        logger.info(f"{req_id} - parse long leverage from message")
+        signal_long_times = int(signal_message_lev)
+    elif signal_message_type == 'short_entry':
+        logger.info(f"{req_id} - parse short leverage from message")
+        signal_short_times = int(signal_message_lev)
+
+    if signal_side == 'BUY':
+        change_leverage(req_id, strategy_client, signal_symbol, signal_long_times)
+    else:
+        change_leverage(req_id, strategy_client, signal_symbol, signal_short_times)
+
+    quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
+                     _quantity_precision)
+
+    logger.info(f"{req_id} - raw_quantity {raw_quantity}")
+    logger.info(f"{req_id} - quantity {quantity}")
+    logger.info(f"{req_id} - signal_position_size {signal_position_size}")
+
+    stop_loss_stop_price = round(
+        (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
+                float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), _price_precision)
+
+    # params override by message
+    if signal_message_json is not None and 'sl' in signal_message_json:
+        logger.info(f"{req_id} - parse stop loss from message")
+        stop_loss_stop_price = round(float(signal_message_json['sl']), _price_precision)
+
+    take_profit_stop_price = round(
+        (float(signal_entry) * (100 + float(signal_long_take_profit)) / 100) if signal_side == 'BUY' else (
+                float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), _price_precision)
+
+    create_swing_order(
+        req_id,
+        strategy_client,
+        strategy,
+        signal_symbol,
+        signal_side,
+        quantity,
+        prev_quantity,
+        prev_opposite_side,
+        signal_entry,
+        'SELL' if signal_side == 'BUY' else 'BUY',
+        stop_loss_stop_price,
+        take_profit_stop_price
+    )
+
+    # entry exit
+    post_data = {
+        'symbol': signal_symbol,
+        'entry': signal_entry,
+        'side': signal_side,
+        'type': signal_message_type,
+        'msg': 'create order'
+    }
+    send_telegram_message(req_id, post_data)
+
+
+def close_order_based_on_notification(
+        req_id,
+        strategy,
+        signal_message_json,
+        signal_symbol,
+        prev_opposite_side,
+        signal_message_type
+):
+    logger.info(f"{req_id} - exit: {signal_message_json['type']}")
+    post_data = {
+        'symbol': signal_symbol,
+        'side': prev_opposite_side,
+        'type': signal_message_type,
+        'msg': 'close prev position'
+    }
+    send_telegram_message(req_id, post_data)
+    # 更新該策略的balace
+    order_list = query_trades_by_group_id(strategy.trade_group_id)
+    # 用原本的掛單查
+    total_realized_pnl = calculate_total_realized_pnl(
+        client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
+    logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+    logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
+    # 新增EXIT紀錄
+    exit_data = {
+        'symbol': signal_symbol,
+        'side': prev_opposite_side,
+        'type': 'EXIT'
+    }
+    create_trades_from_binance(binance_trades=[exit_data], strategy_id=strategy.strategy_id,
+                               trade_group_id=strategy.trade_group_id)
+    # 更新Strategy狀態
+    strategy.status = "INACTIVE"
+    strategy.save()
+    # 更新已實現盈虧到出場紀錄
+    update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
+    logger.info(f"{req_id} - end")
+
+
+###
+
+
+def handle_swing_notification(req_id, strategy, notification):
+    strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+    logger.info(f"{req_id} - strategy client {strategy_client}")
+    signal_symbol = notification['ticker']
+    _price_precision = int(exchange_info_map[signal_symbol]['pricePrecision'])
+    _quantity_precision = int(exchange_info_map[signal_symbol]['quantityPrecision'])
+    signal_position_size = round(float(notification['position_size']), _quantity_precision)
+    signal_message_json = None
+    signal_message_type = None
+    signal_message_lev = None
+    signal_message_eq = None
+    signal_message = notification['message']
+    if signal_message is not None:
+        signal_message_json = json.loads(signal_message)
+        logger.info(f"{req_id} - signal message {signal_message_json}")
+    if signal_message_json is not None and 'type' in signal_message_json:
+        signal_message_type = signal_message_json['type']
+    if signal_message_json is not None and 'lev' in signal_message_json:
+        signal_message_lev = signal_message_json['lev']
+    if signal_message_json is not None and 'eq' in signal_message_json:
+        signal_message_eq = int(float(signal_message_json['eq']))
+        if signal_message_eq > 95:
+            signal_message_eq = 95
+        percentage = signal_message_eq / 100
+    prev_quantity = 0
+    prev_opposite_side = ''
+    allowed_close_position = False
+
+    logger.info(f"{req_id} - check current position")
+    time.sleep(close_position_delay)
+    position = get_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol)
+    if position is not None:
+        logger.info(f"{req_id} - position is not None")
+        prev_quantity = position['positionAmt']
+        prev_opposite_side = 'SELL' if float(prev_quantity) > 0 else (
+            '' if float(prev_quantity) == 0.0 else 'BUY')
+        prev_update_time = int(position['updateTime'])
+        now = datetime.now()
+        timestamp = datetime.timestamp(now) * 1000
+        # diff seconds
+        logger.info(f"{req_id} - current timestamp {timestamp}")
+        logger.info(f"{req_id} - prev timestamp {prev_update_time}")
+        diff = (timestamp - prev_update_time) / 1000
+        # 幣安的掛單先止盈可能也會是False
+        allowed_close_position = True if diff > preserve_prev_position_second else False
+
+    logger.info(f"{req_id} - signal_position_size {signal_position_size}")
+    logger.info(f"{req_id} - allowed_close_position {allowed_close_position}")
+
+    # if signal position == 0, close position
+    # and abs(float(prev_quantity)) > 0  ?
+    if signal_position_size == 0 and allowed_close_position:
+        logger.info(f"{req_id} - close signal")
+        logger.info(f"{req_id} - close prev open order for close signal")
+        cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
+        logger.info(f"{req_id} - close prev position")
+        close_response = close_position(req_id=req_id, strategy_client=strategy_client, symbol=signal_symbol,
+                                        side=prev_opposite_side, quantity=prev_quantity)
+        logger.info(f"{req_id} - close response {close_response}")
+
+        # 更新Strategy狀態
+        strategy.status = "INACTIVE"
+        strategy.save()
+
+        post_data = {
+            'symbol': signal_symbol,
+            'side': prev_opposite_side,
+            'type': signal_message_type,
+            'msg': 'close prev position'
+        }
+        try:
+            send_telegram_message(req_id, post_data)
+        except Exception as e:
+            logger.info(f"{req_id} - An error occurred while sending Telegram message: {e}")
+
+        trade_array = convert_to_trade_array(response=close_response, trade_type_override='EXIT', symbol=signal_symbol)
+        create_trades_from_binance(binance_trades=trade_array, strategy_id=strategy.strategy_id,
+                                   trade_group_id=strategy.trade_group_id)
+        order_list = query_trades_by_group_id(strategy.trade_group_id)
+        # 更新該策略的balace
+        logger.info(f"{req_id} - order list {order_list}")
+        total_realized_pnl = calculate_total_realized_pnl(
+            client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
+        logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+        logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
+        # 更新已實現盈虧到出場紀錄
+        update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
+        logger.info(f"{req_id} - end")
+        return HttpResponse('received')
+
+    # handle exit signal
+    if signal_message_type == 'long_exit' or signal_message_type == 'short_exit':
+        logger.info(f"{req_id} - exit: {signal_message_json['type']}")
+        post_data = {
+            'symbol': signal_symbol,
+            'side': prev_opposite_side,
+            'type': signal_message_type,
+            'msg': 'close prev position'
+        }
+        send_telegram_message(req_id, post_data)
+        # 更新該策略的balace
+        order_list = query_trades_by_group_id(strategy.trade_group_id)
+        # 用原本的掛單查
+        total_realized_pnl = calculate_total_realized_pnl(
+            client.futures_account_trades(symbol=signal_symbol, limit=100), order_list)
+        logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+        logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
+        # 新增EXIT紀錄
+        exit_data = {
+            'symbol': signal_symbol,
+            'side': prev_opposite_side,
+            'type': 'EXIT'
+        }
+        create_trades_from_binance(binance_trades=[exit_data], strategy_id=strategy.strategy_id,
+                                   trade_group_id=strategy.trade_group_id)
+        # 更新Strategy狀態
+        strategy.status = "INACTIVE"
+        strategy.save()
+        # 更新已實現盈虧到出場紀錄
+        update_trade_profit_loss(strategy.trade_group_id, total_realized_pnl)
+        logger.info(f"{req_id} - end")
+        return HttpResponse('received')
+
+    logger.info(f"{req_id} - close prev open order for entry signal")
+    cancel_all_open_order(symbol=signal_symbol, strategy_client=strategy_client)
+
+    time.sleep(create_order_delay)
+    # prepare param
+    all_usdt = Decimal(get_usdt(req_id=req_id, strategy_client=strategy_client))
+    balance = find_balance_by_strategy_id(strategy.strategy_id)
+
+    if balance is not None:
+        usdt = balance.balance
+        logger.info(f"{req_id} - has corresponding balance {usdt}")
+        balance.equity = percentage
+        balance.save()
+        logger.info(f"{req_id} - update equity % {percentage}")
+    else:
+        usdt = strategy.initial_capital
+
+    if usdt > all_usdt:
+        logger.info(f"{req_id} - exceed all usdt")
+        usdt = all_usdt
+
+    usdt = str(usdt)
+
+    logger.info(f"{req_id} - used usdt {usdt}")
+
+    logger.info(f"{req_id} - parse entry")
+    signal_entry = round(float(notification['entry']), _price_precision)
+    logger.info(f"{req_id} - parse side")
+    signal_side = 'SELL' if notification['order'] == 'sell' else 'BUY'
+    logger.info(f"{req_id} - parse long times")
+    signal_long_times = int(notification['strategy']['long']['times'])
+    logger.info(f"{req_id} - parse long stop loss")
+    signal_long_stop_loss = notification['strategy']['long']['stopLoss']
+    logger.info(f"{req_id} - parse long take profit")
+    signal_long_take_profit = notification['strategy']['long']['takeProfit']
+    logger.info(f"{req_id} - parse short times")
+    signal_short_times = int(notification['strategy']['short']['times'])
+    logger.info(f"{req_id} - parse short stop loss")
+    signal_short_stop_loss = notification['strategy']['short']['stopLoss']
+    logger.info(f"{req_id} - parse long take profit")
+    signal_short_take_profit = notification['strategy']['short']['takeProfit']
+    raw_quantity = 0 if usdt is None else math.floor(100000 * float(usdt) * percentage / signal_entry) / 100000
+
+    # params override by message
+    if signal_message_type == 'long_entry':
+        logger.info(f"{req_id} - parse long leverage from message")
+        signal_long_times = int(signal_message_lev)
+    elif signal_message_type == 'short_entry':
+        logger.info(f"{req_id} - parse short leverage from message")
+        signal_short_times = int(signal_message_lev)
+
+    if signal_side == 'BUY':
+        change_leverage(req_id, strategy_client, signal_symbol, signal_long_times)
+    else:
+        change_leverage(req_id, strategy_client, signal_symbol, signal_short_times)
+
+    quantity = round(raw_quantity * int(signal_long_times if signal_side == 'BUY' else signal_short_times),
+                     _quantity_precision)
+
+    logger.info(f"{req_id} - raw_quantity {raw_quantity}")
+    logger.info(f"{req_id} - quantity {quantity}")
+    logger.info(f"{req_id} - signal_position_size {signal_position_size}")
+
+    stop_loss_stop_price = round(
+        (float(signal_entry) * (100 - float(signal_long_stop_loss)) / 100) if signal_side == 'BUY' else (
+                float(signal_entry) * (100 + float(signal_short_stop_loss)) / 100), _price_precision)
+
+    # params override by message
+    if signal_message_json is not None and 'sl' in signal_message_json:
+        logger.info(f"{req_id} - parse stop loss from message")
+        stop_loss_stop_price = round(float(signal_message_json['sl']), _price_precision)
+
+    take_profit_stop_price = round(
+        (float(signal_entry) * (100 + float(signal_long_take_profit)) / 100) if signal_side == 'BUY' else (
+                float(signal_entry) * (100 - float(signal_short_take_profit)) / 100), _price_precision)
+
+    create_swing_order(
+        req_id,
+        strategy_client,
+        strategy,
+        signal_symbol,
+        signal_side,
+        quantity,
+        prev_quantity,
+        prev_opposite_side,
+        signal_entry,
+        'SELL' if signal_side == 'BUY' else 'BUY',
+        stop_loss_stop_price,
+        take_profit_stop_price
+    )
+
+    # entry exit
+    post_data = {
+        'symbol': signal_symbol,
+        'entry': signal_entry,
+        'side': signal_side,
+        'type': signal_message_type,
+        'msg': 'create order'
+    }
+    send_telegram_message(req_id, post_data)
 
 
 def send_telegram_message(req_id, post_data):
@@ -461,7 +1111,7 @@ def close_position_at_price(req_id, strategy_client, symbol, side, stop_price):
     logger.info(f"{req_id} - {response}")
 
 
-def create_order(
+def create_swing_order(
         req_id,
         strategy_client,
         strategy,
@@ -554,7 +1204,8 @@ def create_order(
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
-        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id, trade_group_id=trade_group_id)
+        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id,
+                                   trade_group_id=trade_group_id)
         # 更新Strategy狀態
         strategy.status = "ACTIVE"
         strategy.trade_group_id = trade_group_id
@@ -609,8 +1260,104 @@ def create_order(
     if check_api_enable(enable_create_order):
         response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
         # 創建Trade實例
-        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id, trade_group_id=trade_group_id)
+        create_trades_from_binance(binance_trades=response, strategy_id=strategy.strategy_id,
+                                   trade_group_id=trade_group_id)
         logger.info(f"{req_id} - create_order response 2 {response}")
+
+
+def create_grid_order(
+        req_id,
+        strategy_client,
+        strategy,
+        notification_symbol,
+        side_to_open,
+        quantity_to_open,
+        entry,
+        trade_group_id
+):
+    logger.info(f"{req_id} - create_order, {notification_symbol}, {side_to_open}, {quantity_to_open}, {entry}")
+    _price_precision = int(exchange_info_map[notification_symbol]['pricePrecision'])
+    _quantity_precision = int(exchange_info_map[notification_symbol]['quantityPrecision'])
+    logger.info(f"{req_id} - quantity precision {_quantity_precision}")
+    if (format_decimal(quantity_to_open, _quantity_precision)) == 0:
+        logger.info(f"{req_id} - Unable to open a position: the quantity becomes 0 after precision adjustment")
+
+    # 構造訂單
+    batch_payload = [
+        # 市價入場
+        {
+            'symbol': notification_symbol,
+            'type': 'MARKET',
+            'quantity': format_decimal(quantity_to_open, _quantity_precision),
+            'side': side_to_open
+        }
+    ]
+
+    logger.info(f"{req_id} - batch order', {json.dumps(batch_payload)}")
+    if check_api_enable(enable_create_order):
+        response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+        # 創建Trade實例
+        create_trades_from_binance(
+            binance_trades=response,
+            strategy_id=strategy.strategy_id,
+            trade_group_id=trade_group_id,
+            trade_type_override="GRID_ENTRY"
+        )
+        # 更新Strategy狀態
+        strategy.status = "ACTIVE"
+        strategy.save()
+        logger.info(f"{req_id} - Create order response {response}")
+
+
+def close_grid_order(
+        req_id,
+        strategy_client,
+        strategy,
+        side_to_close,
+        position_info,
+        grid_position,
+        notification_symbol
+):
+    quantity_to_close = grid_position.quantity
+    trade_group_id = grid_position.trade_group_id
+    logger.info(f"{req_id} - Attempting to close position for {notification_symbol} with quantity {quantity_to_close}")
+
+    if position_info is not None:
+        current_position_amt = float(position_info['positionAmt'])
+
+        # 如果当前持仓量小于或等于要平仓的量，则平掉所有持仓
+        quantity_to_close = abs(current_position_amt) if abs(
+            current_position_amt) < quantity_to_close else quantity_to_close
+
+        _quantity_precision = int(exchange_info_map[notification_symbol]['quantityPrecision'])
+        formatted_quantity = format_decimal(quantity_to_close, _quantity_precision)
+
+        # 构造平仓订单
+        order_payload = [
+            # 市價出場
+            {
+                'symbol': notification_symbol,
+                'type': 'MARKET',
+                'quantity': formatted_quantity,
+                'side': side_to_close
+            }
+        ]
+
+        logger.info(f"{req_id} - Closing order: {json.dumps(order_payload)}")
+        if check_api_enable(enable_create_order):
+            response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(order_payload))
+            # 創建Trade實例
+            create_trades_from_binance(
+                binance_trades=response,
+                strategy_id=strategy.strategy_id,
+                trade_group_id=trade_group_id,
+                trade_type_override="GRID_EXIT"
+            )
+            # TODO 判斷是否全部平掉 是的話更新INACTIVE
+            # 记录平仓操作
+            logger.info(f"{req_id} - Close order response: {response}")
+    else:
+        logger.error(f"{req_id} - Failed to get position info for {notification_symbol}")
 
 
 ##############

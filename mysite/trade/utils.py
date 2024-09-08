@@ -1,6 +1,10 @@
 import os
 from decimal import Decimal
-from .models import AccountInfo, Strategy, AccountBalance, Trade
+from django.db import transaction
+
+from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
+
+from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import datetime
@@ -64,7 +68,7 @@ def find_balance_by_strategy_id(strategy_id):
         return None
 
 
-def create_trades_from_binance(binance_trades, strategy_id, trade_group_id, trade_type_override=None):
+def create_trades_from_binance(binance_trades, strategy_id, trade_group_id="NA", trade_type_override=None):
     """
     从Binance交易数据创建Trade实例。
 
@@ -100,7 +104,7 @@ def create_trades_from_binance(binance_trades, strategy_id, trade_group_id, trad
             print(f"An error occurred while processing the trade: {e}")
 
 
-def convert_to_trade_array(response, trade_type_override=None):
+def convert_to_trade_array(response, trade_type_override=None, symbol='NA'):
     """
     将单个平仓响应对象转换为数组，并处理异常情况。
 
@@ -115,7 +119,7 @@ def convert_to_trade_array(response, trade_type_override=None):
 
         trade_data = {
             'orderId': response.get('orderId', '0'),
-            'symbol': response.get('symbol', 'NA'),
+            'symbol': response.get('symbol', symbol),
             'side': response.get('side', 'NA'),
             'type': trade_type,
             'origQty': Decimal(response.get('origQty', '0')),
@@ -140,6 +144,21 @@ def query_trades_by_group_id(trade_group_id):
     thirdparty_ids = [trade.thirdparty_id for trade in trades]
     return thirdparty_ids
 
+
+def query_trade(trade_group_id, trade_type):
+    if not trade_group_id:
+        return None
+
+    try:
+        trade = Trade.objects.get(trade_group_id=trade_group_id, trade_type=trade_type)
+        return trade
+    except ObjectDoesNotExist:
+        # 没有找到符合条件的Trade对象
+        return None
+    except MultipleObjectsReturned:
+        # 找到多于一个符合条件的Trade对象，这取决于你的数据模型是否允许这种情况
+        # 根据实际需求处理这种情况，比如记录日志、抛出异常或其他操作
+        return None
 
 def calculate_total_realized_pnl(response, order_list):
     total_realized_pnl = 0.0
@@ -171,10 +190,10 @@ def update_account_balance(total_realized_pnl, strategy_id):
         return "No update required as the total realized PnL is zero."
 
 
-def update_trade_profit_loss(trade_group_id, total_realized_pnl):
+def update_trade_profit_loss(trade_group_id, total_realized_pnl, trade_type="EXIT"):
     try:
         # 使用 trade_group_id 和 trade_type 找到对应的交易
-        trades = Trade.objects.filter(trade_group_id=trade_group_id, trade_type='EXIT')
+        trades = Trade.objects.filter(trade_group_id=trade_group_id, trade_type=trade_type)
 
         # 确保找到的交易只有一笔
         if trades.count() == 1:
@@ -196,3 +215,101 @@ def get_main_account_info():
     except AccountInfo.DoesNotExist:
         # 如果没有找到该账户，返回 None 或适当的响应
         return None
+
+
+def get_grid_position(strategy, grid_index):
+    """
+    查询是否存在特定策略和网格索引对应的且未开仓的网格位置。
+
+    参数:
+    - strategy: 策略实例
+    - grid_index: 网格索引
+
+    返回:
+    - GridPosition实例，如果找到符合条件的记录；否则返回None。
+    """
+    try:
+        return GridPosition.objects.get(
+            strategy=strategy,
+            grid_index=grid_index
+        )
+    except GridPosition.DoesNotExist:
+        # 如果没有找到符合条件的记录
+        return None
+
+
+def get_total_quantity_for_strategy(strategy):
+    """
+    查询与特定策略相关的所有网格位置的数量（quantity）值的总和。
+
+    参数:
+    - strategy: 策略实例
+
+    返回:
+    - 累计的quantity值。
+    """
+    try:
+        # 获取所有与策略相关的GridPosition记录
+        grid_positions = GridPosition.objects.filter(strategy=strategy)
+
+        # 累计所有quantity值
+        total_quantity = sum(position.quantity for position in grid_positions)
+
+        return total_quantity
+    except Exception as e:
+        # 如果查询过程中发生错误
+        print(f"Error occurred: {e}")
+        return 0  # 或返回其他合适的默认值
+
+
+def close_positions_for_strategy(strategy):
+    """
+    关闭与指定策略相关的所有网格仓位，将它们的is_open字段设置为False。
+
+    参数:
+    - strategy: 策略实例
+
+    返回:
+    - 受影响的仓位数量。
+    """
+    try:
+        # 使用事务来确保操作的原子性
+        with transaction.atomic():
+            # 更新与指定策略相关的所有GridPosition记录的is_open字段
+            affected_rows = GridPosition.objects.filter(strategy=strategy, is_open=True).update(is_open=False)
+
+        return affected_rows
+    except Exception as e:
+        # 如果操作过程中发生错误
+        print(f"Error occurred: {e}")
+        return 0  # 或返回其他合适的默认值
+
+def create_new_grid_position(
+        strategy,
+        grid_index,
+        quantity=0,
+        entry_price=0,
+        is_open=True
+):
+    """
+    创建一个新的 GridPosition 记录。
+
+    参数:
+    - strategy: 策略实例
+    - grid_index: 网格索引
+    - quantity: 开仓数量，默认为0
+    - entry_price: 开仓价格，默认为0
+    - is_open: 是否開倉 默认为True
+
+    返回:
+    - 创建的 GridPosition 实例
+    """
+    new_position = GridPosition.objects.create(
+        strategy=strategy,
+        grid_index=grid_index,
+        quantity=quantity,
+        entry_price=entry_price,
+        is_open=is_open  # 新创建的记录默认为开仓状态
+        # 注意：其他字段如exit_price, stop_price可根据具体情况设置或保留默认值
+    )
+    return new_position

@@ -1,5 +1,6 @@
 *.env
 */*.log
+logs/**
 .idea
 __pycache__
 mysite/test_code.py
