@@ -1,9 +1,9 @@
 import os
+import time  # 新增 time 模組
 from decimal import Decimal
 from django.db import transaction
-
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
-
+from binance.exceptions import BinanceAPIException  # 新增 BinanceAPIException
 from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -37,6 +37,8 @@ def get_monthly_rotating_logger(logger_name, log_dir='logs'):
 
     return logger
 
+# 在文件開頭引入
+logger = get_monthly_rotating_logger('trade')
 
 def format_decimal(value, digit):
     format_string = "{:." + str(digit) + "f}"
@@ -162,12 +164,16 @@ def query_trade(trade_group_id, trade_type):
 
 def calculate_total_realized_pnl(response, order_list):
     total_realized_pnl = 0.0
+    total_commission = 0.0
 
     for trade in response:
         if trade['orderId'] in order_list:
             total_realized_pnl += float(trade['realizedPnl'])
+            total_commission += float(trade['commission'])
 
-    return total_realized_pnl
+    # 扣除總手續費
+    final_pnl = total_realized_pnl - total_commission
+    return final_pnl
 
 
 def update_account_balance(total_realized_pnl, strategy_id):
@@ -313,3 +319,134 @@ def create_new_grid_position(
         # 注意：其他字段如exit_price, stop_price可根据具体情况设置或保留默认值
     )
     return new_position
+
+
+def execute_split_fok_orders(
+    client, 
+    symbol, 
+    side, 
+    total_quantity, 
+    price,
+    quantity_precision,
+    price_precision,
+    split_parts=3,
+    max_retries=3,
+    execution_timeout=20,
+    allow_market_fallback=True  # 新增：允許市價單fallback
+):
+    """
+    將大訂單分割成多個FOK小訂單執行，失敗後可選擇用市價單處理
+    """
+    executed_orders = []
+    total_executed = 0
+    formatted_price = format_decimal(price, price_precision)
+    
+    try:
+        # 1. 先嘗試FOK分批執行
+        single_quantity = total_quantity / split_parts
+        
+        for i in range(split_parts):
+            remaining = total_quantity - total_executed
+            if remaining <= 0:
+                break
+                
+            current_quantity = remaining if i == split_parts - 1 else single_quantity
+            formatted_quantity = format_decimal(current_quantity, quantity_precision)
+            
+            logger.info(f"執行第 {i + 1}/{split_parts} 次FOK訂單, 數量: {formatted_quantity}")
+            
+            # 嘗試FOK訂單
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    order = client.futures_create_order(
+                        symbol=symbol,
+                        side=side,
+                        type='LIMIT',
+                        timeInForce='FOK',
+                        quantity=formatted_quantity,
+                        price=formatted_price
+                    )
+                    
+                    # 檢查訂單狀態
+                    start_time = time.time()
+                    while time.time() - start_time < execution_timeout:
+                        order_status = client.futures_get_order(
+                            symbol=symbol,
+                            orderId=order['orderId']
+                        )
+                        
+                        if order_status['status'] == 'FILLED':
+                            executed_qty = float(order_status['executedQty'])
+                            total_executed += executed_qty
+                            executed_orders.append(order_status)
+                            success = True
+                            logger.info(f"FOK訂單成功: {executed_qty} @ {order_status['avgPrice']}")
+                            break
+                            
+                        elif order_status['status'] in ['EXPIRED', 'CANCELED']:
+                            break
+                            
+                        time.sleep(0.5)
+                        
+                    if success:
+                        break
+                        
+                except BinanceAPIException as e:
+                    logger.error(f"FOK訂單失敗 (嘗試 {attempt + 1}/{max_retries}): {e.message}")
+                    if attempt == max_retries - 1:
+                        break
+                    time.sleep(1)
+        
+        # 2. 檢查是否需要市價單處理剩餘數量
+        remaining_qty = total_quantity - total_executed
+        if remaining_qty > 0 and allow_market_fallback:
+            logger.info(f"使用市價單處理剩餘數量: {remaining_qty}")
+            try:
+                market_order = client.futures_create_order(
+                    symbol=symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=format_decimal(remaining_qty, quantity_precision)
+                )
+                
+                # 等待市價單成交確認
+                start_time = time.time()
+                while time.time() - start_time < execution_timeout:
+                    order_status = client.futures_get_order(
+                        symbol=symbol,
+                        orderId=market_order['orderId']
+                    )
+                    
+                    if order_status['status'] == 'FILLED':
+                        executed_orders.append(order_status)
+                        total_executed += float(order_status['executedQty'])
+                        logger.info(f"市價單成功: {order_status['executedQty']} @ {order_status['avgPrice']}")
+                        break
+                        
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error(f"市價單執行失敗: {str(e)}")
+        
+        # 3. 返回執行結果
+        return {
+            'success': total_executed > 0,
+            'orders': executed_orders,
+            'total_executed': total_executed,
+            'remaining_qty': total_quantity - total_executed,
+            'execution_count': len(executed_orders),
+            'attempted_parts': split_parts,
+            'used_market_order': len(executed_orders) > split_parts  # 判斷是否使用了市價單
+        }
+        
+    except Exception as e:
+        logger.error(f"訂單執行過程發生錯誤: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e),
+            'orders': executed_orders,
+            'total_executed': total_executed,
+            'remaining_qty': total_quantity - total_executed
+        }
+
