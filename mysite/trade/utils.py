@@ -8,6 +8,8 @@ from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import datetime
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 
 def get_monthly_rotating_logger(logger_name, log_dir='logs'):
@@ -246,26 +248,29 @@ def get_grid_position(strategy, grid_index):
 
 def get_total_quantity_for_strategy(strategy):
     """
-    查询与特定策略相关的所有网格位置的数量（quantity）值的总和。
+    查詢與特定策略相關的所有開倉中(is_open=True)的網格倉位數量總和。
 
-    参数:
-    - strategy: 策略实例
+    參數:
+    - strategy: 策略實例
 
     返回:
-    - 累计的quantity值。
+    - 開倉中倉位的累計數量
     """
     try:
-        # 获取所有与策略相关的GridPosition记录
-        grid_positions = GridPosition.objects.filter(strategy=strategy)
+        # 獲取所有與策略相關且is_open=True的GridPosition記錄
+        grid_positions = GridPosition.objects.filter(
+            strategy=strategy,
+            is_open=True
+        )
 
-        # 累计所有quantity值
+        # 累計所有quantity值
         total_quantity = sum(position.quantity for position in grid_positions)
 
         return total_quantity
     except Exception as e:
-        # 如果查询过程中发生错误
-        print(f"Error occurred: {e}")
-        return 0  # 或返回其他合适的默认值
+        # 如果查詢過程中發生錯誤
+        logger.error(f"計算策略總倉位時發生錯誤: {e}")
+        return 0  # 返回預設值
 
 
 def close_positions_for_strategy(strategy):
@@ -320,6 +325,90 @@ def create_new_grid_position(
     )
     return new_position
 
+def execute_single_fok_order(
+    client,
+    symbol,
+    side,
+    quantity,
+    price,
+    quantity_precision,
+    price_precision,
+    max_retries=3,
+    execution_timeout=20,
+    base_price_adjustment=0.00005  # 基礎調整0.005%
+):
+    """
+    執行單個FOK訂單
+    
+    手續費考慮：
+    - 限價單(Maker): 0.02%
+    - 市價單(Taker): 0.05%
+    價格調整策略：
+    - 初始調整：0.005%
+    - 最大調整：0.015%（第三次重試）
+    確保始終優於市價單手續費
+    """
+    formatted_quantity = format_decimal(quantity, quantity_precision)
+    current_price = price
+    
+    for attempt in range(max_retries):
+        # 每次重試增加0.005%
+        price_adjustment = base_price_adjustment * (attempt + 1)  # 0.005%, 0.01%, 0.015%
+        adjusted_price = current_price * (1 + price_adjustment) if side == 'BUY' else current_price * (1 - price_adjustment)
+        formatted_price = format_decimal(adjusted_price, price_precision)
+        
+        logger.info(f"FOK訂單嘗試 {attempt + 1}/{max_retries}: "
+                   f"數量={formatted_quantity}, "
+                   f"價格={formatted_price} "
+                   f"(調整={price_adjustment*100:.4f}%)")
+        
+        try:
+            order = client.futures_create_order(
+                symbol=symbol,
+                side=side,
+                type='LIMIT',
+                timeInForce='FOK',
+                quantity=formatted_quantity,
+                price=formatted_price,
+                priceProtect='TRUE'
+            )
+            
+            # 檢查訂單狀態
+            start_time = time.time()
+            while time.time() - start_time < execution_timeout:
+                order_status = client.futures_get_order(
+                    symbol=symbol,
+                    orderId=order['orderId']
+                )
+                
+                if order_status['status'] == 'FILLED':
+                    executed_qty = float(order_status['executedQty'])
+                    avg_price = float(order_status['avgPrice'])
+                    logger.info(f"FOK訂單成功: {executed_qty} @ {avg_price}")
+                    return {
+                        'success': True,
+                        'order': order_status,
+                        'executed_qty': executed_qty,
+                        'price_adjustment': price_adjustment
+                    }
+                    
+                elif order_status['status'] in ['EXPIRED', 'CANCELED']:
+                    logger.warning(f"訂單未成交，調整價格重試")
+                    break
+                    
+                time.sleep(0.5)
+                
+        except BinanceAPIException as e:
+            logger.error(f"FOK訂單失敗 (嘗試 {attempt + 1}/{max_retries}): {e.message}")
+            if attempt == max_retries - 1:
+                break
+            time.sleep(1)
+            
+    return {
+        'success': False,
+        'executed_qty': 0,
+        'price_adjustment': price_adjustment if 'price_adjustment' in locals() else 0
+    }
 
 def execute_split_fok_orders(
     client, 
@@ -330,123 +419,87 @@ def execute_split_fok_orders(
     quantity_precision,
     price_precision,
     split_parts=3,
+    max_workers=3,
     max_retries=3,
     execution_timeout=20,
-    allow_market_fallback=True  # 新增：允許市價單fallback
+    base_price_adjustment=0.00005  # 基礎調整0.005%
 ):
     """
-    將大訂單分割成多個FOK小訂單執行，失敗後可選擇用市價單處理
+    並行執行多個FOK訂單
+    
+    Args:
+        client: Binance client
+        symbol: 交易對
+        side: 買賣方向
+        total_quantity: 總數量
+        price: 價格
+        quantity_precision: 數量精度
+        price_precision: 價格精度
+        split_parts: 分割次數
+        max_workers: 最大並行數
+        max_retries: 每個訂單最大重試次數
+        execution_timeout: 訂單超時時間
+        base_price_adjustment: 基礎價格調整幅度
     """
+    single_quantity = total_quantity / split_parts
     executed_orders = []
     total_executed = 0
-    formatted_price = format_decimal(price, price_precision)
     
-    try:
-        # 1. 先嘗試FOK分批執行
-        single_quantity = total_quantity / split_parts
-        
-        for i in range(split_parts):
-            remaining = total_quantity - total_executed
-            if remaining <= 0:
-                break
-                
-            current_quantity = remaining if i == split_parts - 1 else single_quantity
-            formatted_quantity = format_decimal(current_quantity, quantity_precision)
+    # 準備所有批次的參數
+    batch_params = []
+    for i in range(split_parts):
+        remaining = total_quantity - total_executed
+        if remaining <= 0:
+            break
             
-            logger.info(f"執行第 {i + 1}/{split_parts} 次FOK訂單, 數量: {formatted_quantity}")
-            
-            # 嘗試FOK訂單
-            success = False
-            for attempt in range(max_retries):
-                try:
-                    order = client.futures_create_order(
-                        symbol=symbol,
-                        side=side,
-                        type='LIMIT',
-                        timeInForce='FOK',
-                        quantity=formatted_quantity,
-                        price=formatted_price
-                    )
-                    
-                    # 檢查訂單狀態
-                    start_time = time.time()
-                    while time.time() - start_time < execution_timeout:
-                        order_status = client.futures_get_order(
-                            symbol=symbol,
-                            orderId=order['orderId']
-                        )
-                        
-                        if order_status['status'] == 'FILLED':
-                            executed_qty = float(order_status['executedQty'])
-                            total_executed += executed_qty
-                            executed_orders.append(order_status)
-                            success = True
-                            logger.info(f"FOK訂單成功: {executed_qty} @ {order_status['avgPrice']}")
-                            break
-                            
-                        elif order_status['status'] in ['EXPIRED', 'CANCELED']:
-                            break
-                            
-                        time.sleep(0.5)
-                        
-                    if success:
-                        break
-                        
-                except BinanceAPIException as e:
-                    logger.error(f"FOK訂單失敗 (嘗試 {attempt + 1}/{max_retries}): {e.message}")
-                    if attempt == max_retries - 1:
-                        break
-                    time.sleep(1)
+        current_quantity = remaining if i == split_parts - 1 else single_quantity
+        batch_params.append({
+            'client': client,
+            'symbol': symbol,
+            'side': side,
+            'quantity': current_quantity,
+            'price': price,
+            'quantity_precision': quantity_precision,
+            'price_precision': price_precision,
+            'max_retries': max_retries,
+            'execution_timeout': execution_timeout,
+            'base_price_adjustment': base_price_adjustment
+        })
+    
+    # 使用線程池並行執行
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {
+            executor.submit(
+                execute_single_fok_order,
+                **params
+            ): i for i, params in enumerate(batch_params)
+        }
         
-        # 2. 檢查是否需要市價單處理剩餘數量
-        remaining_qty = total_quantity - total_executed
-        if remaining_qty > 0 and allow_market_fallback:
-            logger.info(f"使用市價單處理剩餘數量: {remaining_qty}")
+        # 收集結果
+        max_adjustment = 0
+        for future in concurrent.futures.as_completed(future_to_batch):
+            batch_index = future_to_batch[future]
             try:
-                market_order = client.futures_create_order(
-                    symbol=symbol,
-                    side=side,
-                    type='MARKET',
-                    quantity=format_decimal(remaining_qty, quantity_precision)
-                )
-                
-                # 等待市價單成交確認
-                start_time = time.time()
-                while time.time() - start_time < execution_timeout:
-                    order_status = client.futures_get_order(
-                        symbol=symbol,
-                        orderId=market_order['orderId']
-                    )
-                    
-                    if order_status['status'] == 'FILLED':
-                        executed_orders.append(order_status)
-                        total_executed += float(order_status['executedQty'])
-                        logger.info(f"市價單成功: {order_status['executedQty']} @ {order_status['avgPrice']}")
-                        break
-                        
-                    time.sleep(0.5)
-                    
+                result = future.result()
+                if result['success']:
+                    executed_orders.append(result['order'])
+                    total_executed += result['executed_qty']
+                    max_adjustment = max(max_adjustment, result['price_adjustment'])
+                    logger.info(f"批次 {batch_index + 1} 執行成功")
+                else:
+                    logger.warning(f"批次 {batch_index + 1} 執行失敗")
             except Exception as e:
-                logger.error(f"市價單執行失敗: {str(e)}")
-        
-        # 3. 返回執行結果
-        return {
-            'success': total_executed > 0,
-            'orders': executed_orders,
-            'total_executed': total_executed,
-            'remaining_qty': total_quantity - total_executed,
-            'execution_count': len(executed_orders),
-            'attempted_parts': split_parts,
-            'used_market_order': len(executed_orders) > split_parts  # 判斷是否使用了市價單
-        }
-        
-    except Exception as e:
-        logger.error(f"訂單執行過程發生錯誤: {str(e)}")
-        return {
-            'success': False,
-            'error': str(e),
-            'orders': executed_orders,
-            'total_executed': total_executed,
-            'remaining_qty': total_quantity - total_executed
-        }
-
+                logger.error(f"批次 {batch_index + 1} 執行出錯: {str(e)}")
+    
+    # 返回執行結果
+    return {
+        'success': total_executed > 0,
+        'orders': executed_orders,
+        'total_executed': total_executed,
+        'remaining_qty': total_quantity - total_executed,
+        'execution_count': len(executed_orders),
+        'attempted_parts': split_parts,
+        'max_price_adjustment': max_adjustment,
+        'avg_price': sum(float(o['avgPrice']) * float(o['executedQty']) 
+                        for o in executed_orders) / total_executed if total_executed > 0 else 0
+    }

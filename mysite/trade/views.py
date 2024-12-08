@@ -34,7 +34,8 @@ from .utils import (
     create_new_grid_position,
     query_trade,
     get_total_quantity_for_strategy,
-    close_positions_for_strategy
+    close_positions_for_strategy,
+    execute_split_fok_orders
 )
 
 notification_queue_entry = queue.Queue()
@@ -329,6 +330,116 @@ def open_grid_position(
         # 处理可能发生的其他异常
         logger.error(f"{req_id} - error：{e}")
 
+def open_grid_position_v2(
+    req_id,
+    strategy,
+    grids,
+    grid_index,
+    leverage,
+    weight,
+    total_weight,
+    notification_symbol,
+    notification_entry
+):
+    """
+    使用FOK訂單的網格進場V2版本
+    """
+    try:
+        # 直接使用strategy的api資訊
+        strategy_client = Client(strategy.account.api_key, strategy.account.api_secret)
+        if not strategy_client:
+            logger.error(f"{req_id} - Failed to get strategy client")
+            return False
+
+        # 計算開倉數量
+        balance = find_balance_by_strategy_id(strategy.strategy_id)
+        usdt = balance.balance if balance else strategy.initial_capital
+        raw_quantity = 0 if usdt is None else math.floor(
+            100000 * float(usdt) * int(weight) / int(total_weight) / float(notification_entry)
+        ) / 100000
+        quantity_to_open = round(raw_quantity * int(leverage), int(exchange_info_map[notification_symbol]['quantityPrecision']))
+
+        if quantity_to_open <= 0:
+            logger.error(f"{req_id} - Invalid quantity: {quantity_to_open}")
+            return False
+
+        # 生成trade_group_id
+        trade_group_id = uuid.uuid4()
+
+        # 獲取symbol資訊
+        symbol_info = exchange_info_map[notification_symbol]
+        quantity_precision = int(symbol_info['quantityPrecision'])
+        price_precision = int(symbol_info['pricePrecision'])
+
+        # 使用FOK分批進場
+        entry_result = execute_split_fok_orders(
+            client=strategy_client,
+            symbol=notification_symbol,
+            side="BUY",
+            total_quantity=quantity_to_open,
+            price=notification_entry,
+            quantity_precision=quantity_precision,
+            price_precision=price_precision,
+            split_parts=3,
+            max_workers=3,
+            base_price_adjustment=0.00005
+        )
+
+        if entry_result['success']:
+            # 創建或更新GridPosition
+            grid_position = get_grid_position(
+                strategy=strategy,
+                grid_index=grid_index
+            )
+            
+            if not grid_position:
+                grid_position = create_new_grid_position(
+                    strategy=strategy,
+                    grid_index=grid_index
+                )
+
+            # 更新GridPosition
+            grid_position.quantity = entry_result['total_executed']
+            grid_position.entry_price = entry_result['avg_price']
+            grid_position.is_open = True
+            grid_position.trade_group_id = trade_group_id
+            grid_position.save()
+
+            # 創建交易記錄
+            create_trades_from_binance(
+                binance_trades=entry_result['orders'],
+                strategy_id=strategy.strategy_id,
+                trade_group_id=trade_group_id,
+                trade_type_override="GRID_ENTRY"
+            )
+
+            # 更新策略狀態
+            strategy.status = "ACTIVE"
+            strategy.save()
+
+            logger.info(f"{req_id} - Grid entry V2完成: "
+                       f"總成交量={entry_result['total_executed']}, "
+                       f"平均價格={entry_result['avg_price']}, "
+                       f"最大價格調整={entry_result['max_price_adjustment']*100:.4f}%")
+            
+            # 發送Telegram通知
+            post_data = {
+                'symbol': notification_symbol,
+                'entry': entry_result['avg_price'],
+                'side': "BUY",
+                'type': "Grid Long Entry V2",
+                'msg': 'create order with FOK'
+            }
+            send_telegram_message(req_id, post_data)
+            
+            return True
+        else:
+            logger.error(f"{req_id} - Grid entry V2失敗: {entry_result.get('error')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"{req_id} - Open grid position V2 error: {str(e)}")
+        return False
 
 def close_grid_position(
         req_id,
@@ -375,42 +486,28 @@ def close_grid_position(
         )
         ###
         grid_exit_trade = query_trade(trade_group_id=grid_position_to_close.trade_group_id, trade_type="GRID_EXIT")
-        order_list = []
         if grid_exit_trade is not None:
-            order_list.append(grid_exit_trade.thirdparty_id)
+            start_time = str((grid_exit_trade.created_at_timestamp - 3600) * 1000)
+            time.sleep(get_account_trade_delay)
+            update_balance_and_pnl(
+                req_id=req_id,
+                symbol=notification_symbol,
+                trade_group_id=grid_position_to_close.trade_group_id,
+                strategy_id=strategy.strategy_id
+            )
         else:
             logger.info(f"{req_id} - not grid exit record")
             return
 
-        # 更新該策略的balace
-        logger.info(f"{req_id} - order list {order_list}")
-        start_time = str((grid_exit_trade.created_at_timestamp - 3600) * 1000)
-        logger.info(f"{req_id} - start_time {start_time}")
-        time.sleep(get_account_trade_delay)
-        account_trade_res = client.futures_account_trades(symbol=notification_symbol, limit=300, startTime=start_time)
-        logger.info(f"{req_id} - account_trade_res {account_trade_res}")
-        total_realized_pnl = calculate_total_realized_pnl(account_trade_res, order_list)
-        logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
-        logger.info(f"{req_id} - {update_account_balance(total_realized_pnl, strategy.strategy_id)}")
-        # 更新已實現盈虧到出場紀錄
-        update_trade_profit_loss(
-            trade_group_id=strategy.trade_group_id,
-            total_realized_pnl=total_realized_pnl,
-            trade_type="GRID_EXIT"
-        )
         # 關閉網格倉位
         grid_position_to_close.is_open = False
         grid_position_to_close.save()
-        # 更新出場盈虧
-        grid_exit_trade.profit_loss = total_realized_pnl
-        grid_exit_trade.save()
 
     except Exception as e:
         # 处理可能发生的其他异常
         logger.error(f"{req_id} - error：{e}")
 
 
-# TODO
 def close_all_position(
         req_id,
         strategy,
@@ -432,7 +529,6 @@ def close_all_position(
         )
 
         close_positions_for_strategy(strategy=strategy)
-        logger.info("test")
         # 构造平仓订单
         order_payload = [
             # 市價出場
@@ -448,20 +544,29 @@ def close_all_position(
         logger.info(order_payload)
         logger.info(f"{req_id} - Closing order: {json.dumps(order_payload)}")
         if check_api_enable(enable_create_order):
-            response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(order_payload))
+            exit_response = strategy_client.futures_place_batch_order(batchOrders=json.dumps(order_payload))
+            # 生成trade_group_id
+            trade_group_id = uuid.uuid4()
             # 創建Trade實例
-            # create_trades_from_binance(
-            #     binance_trades=response,
-            #     strategy_id=strategy.strategy_id,
-            #     trade_group_id=trade_group_id,
-            #     trade_type_override="GRID_EXIT"
-            # )
-            # TODO 判斷是否全部平掉 是的話更新INACTIVE
-            # 记录平仓操作
-            logger.info(f"{req_id} - Close order response: {response}")
+            create_trades_from_binance(
+                binance_trades=exit_response,
+                strategy_id=strategy.strategy_id,
+                trade_group_id=trade_group_id,
+                trade_type_override="GRID_EXIT"
+            )
+            
+            # 更新餘額和盈虧
+            update_balance_and_pnl(
+                req_id=req_id,
+                symbol=notification_symbol,
+                trade_group_id=trade_group_id,
+                strategy_id=strategy.strategy_id,
+                trade_type="GRID_EXIT"
+            )
+            
+            logger.info(f"{req_id} - Close order response: {exit_response}")
 
     except Exception as e:
-        # 处理可能发生的其他异常
         logger.error(f"{req_id} - error：{e}")
 
 
@@ -1375,3 +1480,40 @@ def run_schedule():
 # 在單獨的線程中運行定時任務
 entry_schedule_thread = threading.Thread(target=run_schedule, daemon=True)
 entry_schedule_thread.start()
+
+def update_balance_and_pnl(req_id, symbol, trade_group_id, strategy_id, start_time=None, trade_type="EXIT"):
+    """
+    更新策略餘額和已實現盈虧
+    
+    Args:
+        req_id: 請求ID用於日誌追蹤
+        symbol: 交易幣種
+        trade_group_id: 交易組ID 
+        strategy_id: 策略ID
+        start_time: 開始時間 (可選)
+        trade_type: 交易類型 (預設為 "EXIT")
+    """
+    # 查詢相關訂單
+    order_list = query_trades_by_group_id(trade_group_id)
+    logger.info(f"{req_id} - order list {order_list}")
+    
+    # 計算已實現盈虧
+    account_trades_params = {
+        'symbol': symbol,
+        'limit': 100
+    }
+    if start_time:
+        account_trades_params['startTime'] = start_time
+        
+    total_realized_pnl = calculate_total_realized_pnl(
+        client.futures_account_trades(**account_trades_params), 
+        order_list
+    )
+    logger.info(f"{req_id} - total_realized_pnl {total_realized_pnl}")
+    
+    # 更新策略餘額
+    update_result = update_account_balance(total_realized_pnl, strategy_id)
+    logger.info(f"{req_id} - {update_result}")
+    
+    # 更新已實現盈虧到出場紀錄
+    update_trade_profit_loss(trade_group_id, total_realized_pnl, trade_type)
