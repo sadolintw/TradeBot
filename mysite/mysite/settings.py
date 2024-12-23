@@ -90,6 +90,9 @@ DATABASES = {
         'PASSWORD': os.environ['DB_PW'],
         'HOST': os.environ['DB_HOST'],
         'PORT': '5432',
+        'OPTIONS': {
+            'options': '-c timezone=Asia/Taipei'
+        }
     }
 }
 
@@ -120,7 +123,8 @@ TIME_ZONE = 'Asia/Taipei'
 
 USE_I18N = True
 
-USE_TZ = True
+# 是否使用UTC時間 會影響資料庫時間
+USE_TZ = False
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.0/howto/static-files/

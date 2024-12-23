@@ -1,5 +1,6 @@
 from django.db import models
 import time
+from django.utils import timezone
 
 class AccountInfo(models.Model):
     account_id = models.AutoField(primary_key=True)
@@ -22,6 +23,7 @@ class Strategy(models.Model):
     strategy_id = models.AutoField(primary_key=True)
     account = models.ForeignKey(AccountInfo, on_delete=models.CASCADE, related_name='strategies')
     strategy_name = models.CharField(max_length=255)
+    strategy_type = models.CharField(max_length=255)
     initial_capital = models.DecimalField(max_digits=10, decimal_places=2)
     risk_parameters = models.TextField(blank=True, null=True)
     entry_criteria = models.TextField(blank=True, null=True)
@@ -32,17 +34,18 @@ class Strategy(models.Model):
     leverage = models.IntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    symbol = models.TextField(blank=True, null=True)
 
     class Meta:
         db_table = 'strategies'
 
     def __str__(self):
-        return (f"Strategy ID: {self.strategy_id}, Name: {self.strategy_name}, "
+        return (f"Strategy ID: {self.strategy_id}, Name: {self.strategy_name}, Type: {self.strategy_type}, "
                 f"Initial Capital: {self.initial_capital}, Risk Parameters: {self.risk_parameters}, "
                 f"Entry Criteria: {self.entry_criteria}, Exit Criteria: {self.exit_criteria}, "
                 f"Status: {self.status}, Passphrase: {self.passphrase}, "
                 f"Trade Group ID: {self.trade_group_id}, "
-                f"Leverage: {self.leverage}, "
+                f"Leverage: {self.leverage}, Symbol: {self.symbol}, "
                 f"Created At: {self.created_at}, Updated At: {self.updated_at}")
 
 class Trade(models.Model):
@@ -107,7 +110,7 @@ class GridPosition(models.Model):
     is_open = models.BooleanField(default=True)
     trade_group_id = models.CharField(max_length=36, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    updated_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         db_table = 'grid_positions'

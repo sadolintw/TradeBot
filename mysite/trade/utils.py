@@ -1,5 +1,6 @@
 import os
 import time  # 新增 time 模組
+import uuid
 from decimal import Decimal
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
@@ -7,9 +8,11 @@ from binance.exceptions import BinanceAPIException  # 新增 BinanceAPIException
 from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition
 import logging
 from logging.handlers import TimedRotatingFileHandler
-import datetime
+from datetime import datetime
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+import threading
+from binance import ThreadedWebsocketManager
 
 
 def get_monthly_rotating_logger(logger_name, log_dir='logs'):
@@ -23,7 +26,7 @@ def get_monthly_rotating_logger(logger_name, log_dir='logs'):
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
 
-        current_month = datetime.datetime.now().strftime("%Y-%m")
+        current_month = datetime.now().strftime("%Y-%m")
         log_filename = f'{log_dir}/my_trade_system_{current_month}.log'
 
         handler = TimedRotatingFileHandler(log_filename, when='MIDNIGHT', interval=1, backupCount=0)
@@ -503,3 +506,338 @@ def execute_split_fok_orders(
         'avg_price': sum(float(o['avgPrice']) * float(o['executedQty']) 
                         for o in executed_orders) / total_executed if total_executed > 0 else 0
     }
+
+# 在類別定義前添加常數定義
+class OrderStatus:
+    NEW = 'NEW'                    # 新訂單
+    PARTIALLY_FILLED = 'PARTIALLY_FILLED'  # 部分成交
+    FILLED = 'FILLED'              # 完全成交
+    CANCELED = 'CANCELED'          # 已取消
+    REJECTED = 'REJECTED'          # 被拒絕
+    EXPIRED = 'EXPIRED'            # 已過期
+    PENDING_CANCEL = 'PENDING_CANCEL'  # 待取消
+
+class OrderType:
+    LIMIT = 'LIMIT'                # 限價單
+    MARKET = 'MARKET'              # 市價單
+    STOP = 'STOP'                  # 止損單
+    STOP_MARKET = 'STOP_MARKET'    # 市價止損
+    TAKE_PROFIT = 'TAKE_PROFIT'    # 止盈單
+    TAKE_PROFIT_MARKET = 'TAKE_PROFIT_MARKET'  # 市價止盈
+    TRAILING_STOP_MARKET = 'TRAILING_STOP_MARKET'  # 跟蹤止損
+
+class OrderSide:
+    BUY = 'BUY'                    # 買入
+    SELL = 'SELL'                  # 賣出
+
+class PositionSide:
+    BOTH = 'BOTH'                  # 雙向持倉
+    LONG = 'LONG'                  # 只做多
+    SHORT = 'SHORT'                # 只做空
+
+class BinanceWebsocketClient:
+    def __init__(self, api_key, api_secret, callback=None, custom_logger=None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.twm = None
+        self.is_running = False
+        self.reconnect_count = 0
+        self.max_reconnects = 10
+        self.reconnect_delay = 5
+        self.last_receive_time = time.time()
+        self._lock = threading.Lock()
+        self.heartbeat_thread = None
+        self.callback = callback if callback else lambda x: None  # 預設空函數
+        self.logger = custom_logger if custom_logger else logger  # 使用 utils 中定義的 logger
+
+    def handle_socket_message(self, msg):
+        """處理websocket訊息的回調函數"""
+        try:
+            self.last_receive_time = time.time()
+            if msg['e'] == 'ORDER_TRADE_UPDATE':
+                order = msg['o']
+                self.logger.info(f"""
+訂單更新詳細信息:
+事件類型: {msg['e']}
+事件時間: {msg['E']}
+交易對: {order['s']}
+客戶端訂單ID: {order['c']}
+訂單方向: {order['S']}
+訂單類型: {order['o']}
+訂單價格: {order['p']}
+訂單數量: {order['q']}
+訂單狀態: {order['X']}
+訂單ID: {order['i']}
+最後成交數量: {order['l']}
+已成交數量: {order['z']}
+最後成交價格: {order['L']}
+手續費資產: {order['N']}
+手續費數量: {order['n']}
+訂單時間: {order['T']}
+成交時間: {order['t']}
+""")
+                # 執行自定義回調函數
+                self.callback(msg)
+                
+        except Exception as e:
+            self.logger.error(f"處理訊息時發生錯誤: {str(e)}")
+
+    def start_websocket(self):
+        """啟動websocket連接"""
+        with self._lock:  # 使用線程鎖
+            try:
+                if self.twm and self.twm.is_alive():
+                    self.stop_websocket()
+                    time.sleep(1)  # 等待舊連接完全關閉
+
+                self.twm = ThreadedWebsocketManager(
+                    api_key=self.api_key,
+                    api_secret=self.api_secret
+                )
+                self.twm.start()
+                self.is_running = True
+                
+                # 訂閱用戶數據流
+                self.twm.start_futures_socket(
+                    callback=self.handle_socket_message
+                )
+                
+                self.logger.info("Websocket連接已啟動")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"啟動Websocket時發生錯誤: {str(e)}")
+                return False
+
+    def stop_websocket(self):
+        """停止websocket連接"""
+        with self._lock:  # 使用線程鎖
+            try:
+                self.is_running = False
+                if self.twm:
+                    self.twm.stop()
+                    self.twm = None
+                self.logger.info("Websocket連接已停止")
+            except Exception as e:
+                self.logger.error(f"停止Websocket時發生錯誤: {str(e)}")
+
+    def _check_connection(self):
+        """檢查連接狀態"""
+        while self.is_running:
+            try:
+                time.sleep(30)  # 每30秒檢查一次
+                if not self.twm or not self.twm.is_alive():
+                    self.logger.warning("檢測到連接已斷開，嘗試重新連接...")
+                    if self.start_websocket():
+                        self.reconnect_count = 0
+                    else:
+                        self.reconnect_count += 1
+                        if self.reconnect_count >= self.max_reconnects:
+                            self.logger.error("達到最大重連次數，停止服務")
+                            self.stop_websocket()
+                            break
+            except Exception as e:
+                self.logger.error(f"連接檢查時發生錯誤: {str(e)}")
+
+    def run(self):
+        """運行主循環"""
+        try:
+            if self.start_websocket():
+                # 啟動心跳檢查線程
+                self.heartbeat_thread = threading.Thread(target=self._check_connection)
+                self.heartbeat_thread.daemon = True
+                self.heartbeat_thread.start()
+
+                while self.is_running:
+                    time.sleep(1)
+                    # print("running")
+                    
+        except KeyboardInterrupt:
+            self.logger.info("收到終止信號")
+        finally:
+            self.stop_websocket()
+
+def get_grid_positions_by_strategy(strategy, ascending=True):
+    """
+    查詢特定策略的所有網格倉位。
+
+    參數:
+    - strategy: 策略實例
+    - ascending: 是否按網格索引升序排列，預設True（由小到大）
+
+    返回:
+    - list[GridPosition]: 該策略的所有網格倉位列表，如果沒有則返回空列表。
+    """
+    try:
+        # 根據 ascending 參數決定排序方式
+        order_field = 'grid_index' if ascending else '-grid_index'
+        
+        positions = GridPosition.objects.filter(
+            strategy=strategy
+        ).order_by(order_field)
+        
+        return list(positions)
+    except Exception as e:
+        logger.error(f"查詢策略網格倉位時發生錯誤: {e}")
+        return []
+
+def update_grid_positions_price(strategy, levels: list[float]):
+    """
+    更新策略網格倉位的進出場價格
+    
+    Args:
+        strategy: 策略實例
+        levels: 網格價格陣列(包含上下界)
+        
+    Returns:
+        bool: 更新是否成功
+    """
+    try:
+        positions = get_grid_positions_by_strategy(strategy=strategy)
+        positions_to_update = []
+        
+        for position in positions:
+            grid_index = position.grid_index
+            if grid_index < len(levels) - 1:
+                position.entry_price = levels[grid_index]
+                position.exit_price = levels[grid_index + 1]
+                positions_to_update.append(position)
+                
+        # 使用 bulk_update 一次性更新所有記錄
+        if positions_to_update:
+            GridPosition.objects.bulk_update(
+                positions_to_update, 
+                ['entry_price', 'exit_price']
+            )
+                
+        logger.info(f"策略 {strategy.strategy_id} 的網格倉位價格已更新")
+        return True
+        
+    except Exception as e:
+        logger.error(f"更新網格倉位價格時發生錯誤: {e}")
+        return False
+
+def generate_grid_levels(lower_bound: float, upper_bound: float, grids: int, digit: int = 3) -> list[float]:
+    """
+    生成網格交易的價格點位陣列
+    
+    Args:
+        lower_bound: 最低價格
+        upper_bound: 最高價格
+        grids: 網格數量
+        digit: 小數點後位數，預設為3
+        
+    Returns:
+        list[float]: 由低到高排序的價格點位陣列
+    """
+    # 包含上下界
+    _grids = grids + 1
+    # 確保輸入參數有效
+    if lower_bound >= upper_bound:
+        raise ValueError("下界必須小於上界")
+    if grids < 2:
+        raise ValueError("網格數量必須大於等於2")
+    if digit < 0:
+        raise ValueError("小數點位數不能為負數")
+        
+    # 計算每個網格的價格間距
+    grid_size = (upper_bound - lower_bound) / (_grids - 1)
+    
+    # 生成所有價格點位並四捨五入到指定小數位
+    grid_levels = [round(lower_bound + (grid_size * i), digit) for i in range(_grids)]
+    
+    return grid_levels
+
+def generate_trade_group_id():
+    """
+    生成交易群組ID
+    格式: yyyyMMddHHmmss-{uuid最後12位}
+    
+    Returns:
+        str: 交易群組ID
+    """
+    now = datetime.now()
+    date_str = now.strftime('%Y%m%d%H%M%S')
+    uuid_str = str(uuid.uuid4()).split('-')[-1]  # 取最後一段
+    return f"{date_str}-{uuid_str}"
+
+def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
+    """
+    生成網格交易的批次掛單資料，每批最多5個訂單
+    https://developers.binance.com/docs/zh-CN/derivatives/usds-margined-futures/trade/rest-api/Place-Multiple-Orders
+
+    Args:
+        strategy: 策略實例
+        current_grid_index: 當前網格索引
+        
+    Returns:
+        list: 批次掛單資料陣列的列表，每個陣列最多包含5個訂單
+    """
+    try:
+        # 檢查策略資訊
+        logger.info(f"Strategy info - ID: {strategy.strategy_id}, Symbol: {strategy.symbol}")
+        
+        # 取得所有網格倉位並檢查
+        positions = get_grid_positions_by_strategy(strategy=strategy)
+        logger.info(f"Raw positions query result: {positions}")
+        
+        if not positions:
+            logger.error("No positions found for strategy")
+            return []
+            
+        all_orders = []
+        current_batch = []
+        trade_group_id = generate_trade_group_id()
+        
+        logger.info(f"Number of positions found: {len(positions)}")
+        
+        for position in positions:
+            logger.info(f"Processing position: {position.__dict__}")
+            
+            if position.grid_index == current_grid_index:
+                logger.info(f"Skipping current grid index {current_grid_index}")
+                continue
+            
+            # 基本訂單資訊
+            order = {
+                'symbol': strategy.symbol,
+                'type': 'LIMIT',
+                'timeInForce': 'GTC',
+                'quantity': str(position.quantity),
+                'newClientOrderId': f"{trade_group_id}_{position.grid_index}"
+            }
+            
+            # 根據網格索引添加買賣方向和價格
+            if position.grid_index < current_grid_index:
+                logger.info(f"Creating BUY order for grid {position.grid_index}")
+                order.update({
+                    'price': str(position.entry_price),
+                    'side': 'BUY'
+                })
+            else:
+                logger.info(f"Creating SELL order for grid {position.grid_index}")
+                order.update({
+                    'price': str(position.exit_price),
+                    'side': 'SELL'
+                })
+            
+            current_batch.append(order)
+            logger.info(f"Added order to current batch: {order}")
+            
+            # 當前批次達到5個訂單時，將其加入all_orders並重置current_batch
+            if len(current_batch) == 5:
+                all_orders.append(current_batch)
+                current_batch = []
+        
+        # 處理剩餘的訂單
+        if current_batch:
+            all_orders.append(current_batch)
+        
+        logger.info(f"Total batches created: {len(all_orders)}, "
+                   f"Total orders: {sum(len(batch) for batch in all_orders)}")
+        return all_orders
+        
+    except Exception as e:
+        logger.error(f"生成批次掛單資料時發生錯誤: {str(e)}")
+        logger.error(f"Error traceback: ", exc_info=True)
+        return []
