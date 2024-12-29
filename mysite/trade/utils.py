@@ -1,11 +1,12 @@
 import os
+import json
 import time  # 新增 time 模組
 import uuid
 from decimal import Decimal
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from binance.exceptions import BinanceAPIException  # 新增 BinanceAPIException
-from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition
+from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition, OrderExecution
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
@@ -13,6 +14,8 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from binance import ThreadedWebsocketManager
+from django.db.utils import DatabaseError
+
 
 
 def get_monthly_rotating_logger(logger_name, log_dir='logs'):
@@ -45,16 +48,50 @@ def get_monthly_rotating_logger(logger_name, log_dir='logs'):
 # 在文件開頭引入
 logger = get_monthly_rotating_logger('trade')
 
+exchange_info_map = {}
+
+def set_exchange_info_map(new_exchange_info_map):
+    global exchange_info_map
+    exchange_info_map = new_exchange_info_map
+
 def format_decimal(value, digit):
     format_string = "{:." + str(digit) + "f}"
     return format_string.format(value)
 
+def format_decimal_symbol_quantity(symbol, value):
+    return format_decimal(value, exchange_info_map[symbol]['quantityPrecision'])
 
-def strategy_list():
-    strategies = Strategy.objects.all()
-    print('list strategies')
-    for strategy in strategies:
-        print(strategy)
+def format_decimal_symbol_price(symbol, value):
+    return format_decimal(value, exchange_info_map[symbol]['pricePrecision'])
+
+def strategy_list(status: str = None) -> list:
+    """
+    列出策略清單,可選擇依狀態篩選
+    
+    Args:
+        status: 策略狀態(可選),例如 'ACTIVE'
+        
+    Returns:
+        list: Strategy 物件列表
+    """
+    try:
+        # 根據是否有 status 參數來決定查詢條件
+        if status:
+            strategies = Strategy.objects.filter(status=status)
+            logger.info(f'列出 {status} 狀態的策略')
+        else:
+            strategies = Strategy.objects.all()
+            logger.info('列出所有策略')
+            
+        # 列印策略資訊
+        # for strategy in strategies:
+        #     logger.info(str(strategy))
+            
+        return list(strategies)
+        
+    except Exception as e:
+        logger.error(f"列出策略清單時發生錯誤: {str(e)}")
+        return []
 
 
 def find_strategy_by_passphrase(passphrase):
@@ -110,6 +147,65 @@ def create_trades_from_binance(binance_trades, strategy_id, trade_group_id="NA",
         except Exception as e:
             print(f"An error occurred while processing the trade: {e}")
 
+def create_trade(
+    strategy_id: str,
+    symbol: str,
+    trade_side: str,
+    trade_type: str,
+    quantity: float,
+    price: float,
+    trade_group_id: str = "NA",
+    thirdparty_id: str = "0"
+) -> Trade:
+    """
+    建立單筆交易記錄
+
+    Args:
+        strategy_id: 策略ID
+        symbol: 交易對符號
+        trade_side: 交易方向 (BUY/SELL)
+        trade_type: 交易類型
+        quantity: 交易數量
+        price: 交易價格
+        trade_group_id: 交易組ID (選填)
+        thirdparty_id: 第三方訂單ID (選填)
+
+    Returns:
+        Trade: 創建的交易實例
+        
+    Raises:
+        Strategy.DoesNotExist: 找不到對應的策略
+        Exception: 其他錯誤
+    """
+    try:
+        # 獲取策略實例
+        strategy_instance = Strategy.objects.get(strategy_id=strategy_id)
+        
+        # 創建 Trade 實例
+        trade = Trade(
+            thirdparty_id=thirdparty_id,
+            strategy=strategy_instance,
+            symbol=symbol,
+            trade_side=trade_side,
+            trade_type=trade_type,
+            quantity=Decimal(str(quantity)),  # 確保轉換為 Decimal
+            price=Decimal(str(price)),        # 確保轉換為 Decimal
+            trade_group_id=trade_group_id
+        )
+        trade.save()
+        
+        logger.info(f"成功創建交易記錄 - Order ID: {trade.thirdparty_id}, "
+                   f"Symbol: {symbol}, Side: {trade_side}, "
+                   f"Quantity: {quantity}, Price: {price}")
+        
+        return trade
+        
+    except Strategy.DoesNotExist:
+        logger.error(f"找不到策略 ID: {strategy_id}")
+        raise
+    except Exception as e:
+        logger.error(f"創建交易記錄時發生錯誤: {str(e)}")
+        raise
 
 def convert_to_trade_array(response, trade_type_override=None, symbol='NA'):
     """
@@ -152,19 +248,38 @@ def query_trades_by_group_id(trade_group_id):
     return thirdparty_ids
 
 
-def query_trade(trade_group_id, trade_type):
+def query_trade(trade_group_id, trade_type=None):
+    """
+    查詢交易記錄
+    
+    Args:
+        trade_group_id: 交易組ID
+        trade_type: 交易類型(可選)
+        
+    Returns:
+        Trade: 符合條件的交易記錄,如果沒找到則返回 None
+    """
     if not trade_group_id:
         return None
 
     try:
-        trade = Trade.objects.get(trade_group_id=trade_group_id, trade_type=trade_type)
+        # 根據是否有傳入 trade_type 來建立查詢條件
+        if trade_type:
+            trade = Trade.objects.get(
+                trade_group_id=trade_group_id, 
+                trade_type=trade_type
+            )
+        else:
+            trade = Trade.objects.get(trade_group_id=trade_group_id)
+            
         return trade
+        
     except ObjectDoesNotExist:
-        # 没有找到符合条件的Trade对象
+        # 沒有找到符合條件的 Trade 對象
         return None
     except MultipleObjectsReturned:
-        # 找到多于一个符合条件的Trade对象，这取决于你的数据模型是否允许这种情况
-        # 根据实际需求处理这种情况，比如记录日志、抛出异常或其他操作
+        # 找到多個符合條件的 Trade 對象
+        # 根據實際需求處理這種情況
         return None
 
 def calculate_total_realized_pnl(response, order_list):
@@ -547,8 +662,13 @@ class BinanceWebsocketClient:
         self.last_receive_time = time.time()
         self._lock = threading.Lock()
         self.heartbeat_thread = None
-        self.callback = callback if callback else lambda x: None  # 預設空函數
-        self.logger = custom_logger if custom_logger else logger  # 使用 utils 中定義的 logger
+        self.callback = callback if callback else lambda x: None
+        self.logger = custom_logger if custom_logger else logger
+        # 創建線程池
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=10,
+            thread_name_prefix="WebsocketCallback"
+        )
 
     def handle_socket_message(self, msg):
         """處理websocket訊息的回調函數"""
@@ -556,7 +676,9 @@ class BinanceWebsocketClient:
             self.last_receive_time = time.time()
             if msg['e'] == 'ORDER_TRADE_UPDATE':
                 order = msg['o']
-                self.logger.info(f"""
+                # 使用 OrderStatus 類來檢查訂單狀態
+                if order['X'] not in [OrderStatus.CANCELED, OrderStatus.NEW]:
+                    self.logger.info(f"""
 訂單更新詳細信息:
 事件類型: {msg['e']}
 事件時間: {msg['E']}
@@ -573,11 +695,13 @@ class BinanceWebsocketClient:
 最後成交價格: {order['L']}
 手續費資產: {order['N']}
 手續費數量: {order['n']}
+已實現盈虧: {order['rp']}
 訂單時間: {order['T']}
 成交時間: {order['t']}
 """)
-                # 執行自定義回調函數
-                self.callback(msg)
+                # 檢查是否還在運行中
+                if self.is_running and self.thread_pool:
+                    self.thread_pool.submit(self.callback, msg)
                 
         except Exception as e:
             self.logger.error(f"處理訊息時發生錯誤: {str(e)}")
@@ -614,12 +738,28 @@ class BinanceWebsocketClient:
         with self._lock:  # 使用線程鎖
             try:
                 self.is_running = False
+                
+                # 先關閉 WebSocket 連接
                 if self.twm:
                     self.twm.stop()
                     self.twm = None
+                
+                # 關閉線程池前等待所有任務完成
+                if hasattr(self, 'thread_pool') and self.thread_pool:
+                    self.thread_pool.shutdown(wait=True)
+                    self.thread_pool = None
+                    
                 self.logger.info("Websocket連接已停止")
             except Exception as e:
                 self.logger.error(f"停止Websocket時發生錯誤: {str(e)}")
+
+    def __del__(self):
+        """析構函數，確保資源被釋放"""
+        try:
+            self.stop_websocket()
+        except Exception as e:
+            if self.logger:  # 確保 logger 還存在
+                self.logger.error(f"清理 WebSocket 客戶端時發生錯誤: {str(e)}")
 
     def _check_connection(self):
         """檢查連接狀態"""
@@ -717,7 +857,7 @@ def update_grid_positions_price(strategy, levels: list[float]):
         logger.error(f"更新網格倉位價格時發生錯誤: {e}")
         return False
 
-def generate_grid_levels(lower_bound: float, upper_bound: float, grids: int, digit: int = 3) -> list[float]:
+def generate_grid_levels(lower_bound: float, upper_bound: float, grids: int, symbol: str) -> list[float]:
     """
     生成網格交易的價格點位陣列
     
@@ -725,26 +865,29 @@ def generate_grid_levels(lower_bound: float, upper_bound: float, grids: int, dig
         lower_bound: 最低價格
         upper_bound: 最高價格
         grids: 網格數量
-        digit: 小數點後位數，預設為3
+        symbol: 交易對符號
         
     Returns:
         list[float]: 由低到高排序的價格點位陣列
     """
     # 包含上下界
     _grids = grids + 1
-    # 確保輸入參數有效
+    tick_size = float(exchange_info_map[symbol]["tickSize"])
+    price_precision = int(exchange_info_map[symbol]['pricePrecision'])
+
     if lower_bound >= upper_bound:
         raise ValueError("下界必須小於上界")
     if grids < 2:
         raise ValueError("網格數量必須大於等於2")
-    if digit < 0:
-        raise ValueError("小數點位數不能為負數")
         
-    # 計算每個網格的價格間距
     grid_size = (upper_bound - lower_bound) / (_grids - 1)
     
-    # 生成所有價格點位並四捨五入到指定小數位
-    grid_levels = [round(lower_bound + (grid_size * i), digit) for i in range(_grids)]
+    grid_levels = []
+    for i in range(_grids):
+        price = lower_bound + (grid_size * i)
+        # 先根據 tick size 調整價格，再根據 price precision 進行四捨五入
+        adjusted_price = round(round(price / tick_size) * tick_size, price_precision)
+        grid_levels.append(adjusted_price)
     
     return grid_levels
 
@@ -761,7 +904,7 @@ def generate_trade_group_id():
     uuid_str = str(uuid.uuid4()).split('-')[-1]  # 取最後一段
     return f"{date_str}-{uuid_str}"
 
-def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
+def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logger=logger):
     """
     生成網格交易的批次掛單資料，每批最多5個訂單
     https://developers.binance.com/docs/zh-CN/derivatives/usds-margined-futures/trade/rest-api/Place-Multiple-Orders
@@ -775,11 +918,20 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
     """
     try:
         # 檢查策略資訊
-        logger.info(f"Strategy info - ID: {strategy.strategy_id}, Symbol: {strategy.symbol}")
+        symbol = strategy.symbol
+        leverage = strategy.leverage
+        leverage_rate = strategy.leverage_rate
+        balance = get_balance_by_symbol(symbol)
+        
+        # 將所有數值轉換為 float 進行計算
+        quantity_by_balance = float(balance.balance) * 0.015 * leverage * float(leverage_rate) / mark_price  # 根據餘額計算
+        quantity_by_min_notional = int(5 / mark_price + 1)  # 最小名義價值5U
+        quantity = max(quantity_by_balance, quantity_by_min_notional)
+        # logger.info(f"Strategy info - ID: {strategy.strategy_id}, Symbol: {symbol}")
         
         # 取得所有網格倉位並檢查
         positions = get_grid_positions_by_strategy(strategy=strategy)
-        logger.info(f"Raw positions query result: {positions}")
+        # logger.info(f"Raw positions query result: {positions}")
         
         if not positions:
             logger.error("No positions found for strategy")
@@ -791,11 +943,8 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
         
         logger.info(f"Number of positions found: {len(positions)}")
         
-        for position in positions:
-            logger.info(f"Processing position: {position.__dict__}")
-            
+        for i, position in enumerate(positions):
             if position.grid_index == current_grid_index:
-                logger.info(f"Skipping current grid index {current_grid_index}")
                 continue
             
             # 基本訂單資訊
@@ -803,26 +952,28 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
                 'symbol': strategy.symbol,
                 'type': 'LIMIT',
                 'timeInForce': 'GTC',
-                'quantity': str(position.quantity),
-                'newClientOrderId': f"{trade_group_id}_{position.grid_index}"
+                'quantity': format_decimal_symbol_quantity(symbol, quantity),
+                'newClientOrderId': f"{trade_group_id}_{position.grid_index}",
             }
             
-            # 根據網格索引添加買賣方向和價格
+            # 單向持倉模式下:
+            # - 低於當前網格掛買單，成交後形成多倉
+            # - 高於當前網格掛賣單，成交後形成空倉
             if position.grid_index < current_grid_index:
-                logger.info(f"Creating BUY order for grid {position.grid_index}")
+                # logger.info(f"Creating BUY order at grid {position.grid_index}")
                 order.update({
-                    'price': str(position.entry_price),
+                    'price': format_decimal_symbol_price(symbol, position.entry_price),
                     'side': 'BUY'
                 })
             else:
-                logger.info(f"Creating SELL order for grid {position.grid_index}")
+                # logger.info(f"Creating SELL order at grid {position.grid_index}")
                 order.update({
-                    'price': str(position.exit_price),
+                    'price': format_decimal_symbol_price(symbol, position.entry_price),
                     'side': 'SELL'
                 })
             
             current_batch.append(order)
-            logger.info(f"Added order to current batch: {order}")
+            # logger.info(f"Added order to current batch: {order} (position {i+1})")
             
             # 當前批次達到5個訂單時，將其加入all_orders並重置current_batch
             if len(current_batch) == 5:
@@ -841,3 +992,528 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, logger=logger):
         logger.error(f"生成批次掛單資料時發生錯誤: {str(e)}")
         logger.error(f"Error traceback: ", exc_info=True)
         return []
+
+def get_position_info(client, symbol=None):
+    """
+    獲取合約持倉資訊。若不指定 symbol，則返回所有持倉
+    
+    Args:
+        client: Binance client
+        symbol: 交易對，預設 None (返回所有持倉)
+        
+    Returns:
+        如果指定 symbol: 返回單一幣種的持倉資訊 dict 或 None
+        如果未指定 symbol: 返回所有持倉資訊的 list
+    """
+    try:
+        positions = client.futures_position_information()
+        
+        # 過濾出有持倉量的倉位（positionAmt 不為 0）
+        active_positions = [
+            {
+                'symbol': pos['symbol'],
+                'position_amount': float(pos['positionAmt']),
+                'entry_price': float(pos['entryPrice']),
+                'unrealized_pnl': float(pos['unRealizedProfit']),
+                'leverage': float(pos['leverage']),
+                'mark_price': float(pos['markPrice']),
+                'liquidation_price': float(pos['liquidationPrice']),
+                'isolated': pos['isolated'],
+                # 計算持倉價值和保證金
+                'position_value': abs(float(pos['positionAmt']) * float(pos['entryPrice'])),
+                'margin': abs(float(pos['positionAmt']) * float(pos['entryPrice'])) / float(pos['leverage'])
+            }
+            for pos in positions
+            if float(pos['positionAmt']) != 0
+        ]
+        
+        if symbol:
+            # 如果指定了 symbol，返回該幣種的持倉資訊
+            for pos in active_positions:
+                if pos['symbol'] == symbol:
+                    return pos
+            return None
+        else:
+            # 如果未指定 symbol，返回所有持倉資訊
+            return active_positions
+            
+    except Exception as e:
+        logger.error(f"獲取持倉資訊時發生錯誤: {str(e)}")
+        return None
+
+def update_all_future_positions(client):
+    """
+    取得所有合約持倉的摘要資訊並更新資料庫
+    
+    Args:
+        client: Binance client
+        
+    Returns:
+        dict: 需要平倉的 symbol 對應的訂單資訊，例如 {"ONDOUSDT": {...平倉訂單...}}
+    """
+    positions = get_position_info(client)
+    close_orders_map = {}
+    
+    if not positions:
+        logger.info("目前沒有任何合約持倉")
+        return close_orders_map
+    
+    total_pnl = 0
+    total_margin = 0
+    balances_to_update = []
+    
+    logger.info("\n=== 合約持倉摘要 ===")
+    
+    for pos in positions:
+        total_pnl += pos['unrealized_pnl']
+        total_margin += pos['margin']
+        symbol = pos['symbol']
+        strategy = Strategy.objects.get(symbol=symbol, status='ACTIVE')
+        balance = AccountBalance.objects.get(strategy=strategy)
+        
+        if balance:
+            margin = pos['margin']
+            current_balance = float(balance.balance)
+            hold_rate = margin/current_balance
+            position_amount = float(pos['position_amount'])
+            
+            # 檢查是否超過策略設定的 hold_rate
+            if hold_rate > strategy.hold_rate:
+                # 計算需要平倉的數量（一半持倉）
+                close_quantity = abs(position_amount) / 2
+                
+                # 決定平倉方向
+                close_side = 'SELL' if position_amount > 0 else 'BUY'
+                
+                # 創建平倉訂單
+                close_order = {
+                    'symbol': symbol,
+                    'side': close_side,
+                    'type': 'MARKET',
+                    'quantity': format_decimal_symbol_quantity(symbol, close_quantity),
+                    'reduceOnly': 'true'  # 確保這是平倉訂單
+                }
+                
+                # 將訂單加入 map
+                close_orders_map[symbol] = close_order
+            
+            logger.info(f"""
+{pos['symbol']}:
+已投入保證金: {pos['margin']:.8f} USDT
+剩餘資金: {balance.balance:.8f} USDT
+持倉數量: {pos['position_amount']} ({"多倉" if pos['position_amount'] > 0 else "空倉"})
+持倉均價: {pos['entry_price']}
+持倉價值: {pos['position_value']:.8f} USDT
+持倉比例 {hold_rate:.8} {"(超過限制)" if hold_rate > strategy.hold_rate else ""}
+未實現盈虧: {pos['unrealized_pnl']}
+槓桿倍數: {pos['leverage']}x
+標記價格: {pos['mark_price']}
+強平價格: {pos['liquidation_price']}
+保證金模式: {"逐倉" if pos['isolated'] else "全倉"}
+------------------------""")
+            
+            # 更新 balance 資料
+            balance.used_margin = float(pos['margin'])
+            balance.unrealized_pnl = float(pos['unrealized_pnl'])
+            balance.position_value = float(pos['position_value'])
+            balance.position_amount = float(pos['position_amount'])
+            balances_to_update.append(balance)
+    
+    # 使用 bulk_update 一次性更新所有 balance
+    if balances_to_update:
+        AccountBalance.objects.bulk_update(
+            balances_to_update, 
+            ['used_margin', 'unrealized_pnl', 'position_value', 
+             'position_amount']
+        )
+        
+    logger.info(f"""
+=== 總計 ===
+總未實現盈虧: {total_pnl:.2f} USDT
+總投入保證金: {total_margin:.2f} USDT
+投資報酬率: {(total_pnl/total_margin*100):.2f}% (未實現盈虧/總保證金)
+""")
+
+    return close_orders_map
+
+def get_strategy_by_symbol(symbol):
+    return Strategy.objects.get(symbol=symbol, status='ACTIVE')
+
+def get_balance_by_symbol(symbol):
+    """
+    通過交易對符號查詢對應的帳戶餘額
+    
+    Args:
+        symbol: 交易對符號
+        
+    Returns:
+        Decimal: 帳戶餘額，如果找不到則返回 None
+    """
+    try:
+        strategy = Strategy.objects.get(symbol=symbol, status='ACTIVE')
+        account_balance = AccountBalance.objects.get(strategy=strategy)
+        return account_balance
+    except (Strategy.DoesNotExist, AccountBalance.DoesNotExist):
+        logger.warning(f"找不到 {symbol} 對應的活躍策略帳戶餘額")
+        return None
+
+def get_current_price(client, symbol):
+    """
+    獲取指定合約的當前價格
+    
+    Args:
+        client: Binance client
+        symbol: 交易對符號 (例如: 'BTCUSDT')
+        
+    Returns:
+        dict: {
+            'symbol': 交易對符號,
+            'mark_price': 標記價格,
+            'index_price': 指數價格,
+            'estimated_settle_price': 預估結算價格,
+            'last_funding_rate': 最後一次資金費率,
+            'next_funding_time': 下次資金費率時間,
+            'timestamp': 時間戳
+        }
+        發生錯誤時返回 None
+    """
+    try:
+        price_info = client.futures_mark_price(symbol=symbol)
+        
+        # 轉換數據類型並整理返回格式
+        return {
+            'symbol': price_info['symbol'],
+            'mark_price': float(price_info['markPrice']),
+            'index_price': float(price_info['indexPrice']),
+            'estimated_settle_price': float(price_info['estimatedSettlePrice']),
+            'last_funding_rate': float(price_info['lastFundingRate']),
+            'next_funding_time': int(price_info['nextFundingTime']),
+            'timestamp': int(price_info['time'])
+        }
+        
+    except BinanceAPIException as e:
+        logger.error(f"獲取 {symbol} 價格時發生 Binance API 錯誤: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"獲取 {symbol} 價格時發生未預期錯誤: {str(e)}")
+        return None
+
+def grid_v2_lab(client, passphrase, symbol):
+    client.futures_cancel_all_open_orders(symbol=symbol)
+    price = get_current_price(client, symbol)
+    mark_price = price['mark_price']
+    upper_bound = mark_price * (1 + 0.025)
+    lower_bound = mark_price * (1 - 0.025)
+    levels = generate_grid_levels(lower_bound, upper_bound, 10, symbol)
+    logger.info(levels)
+    strategy = find_strategy_by_passphrase(passphrase)
+    leverage = strategy.leverage
+    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+    update_grid_positions_price(strategy, levels)
+    batch_payloads = grid_v2_create_batch_payload(strategy=strategy, current_grid_index=5, mark_price=mark_price)
+    # print(batch_payloads)
+    # 分批發送訂單
+    for batch in batch_payloads:
+        logger.info(f"Sending batch order: {json.dumps(batch)}")
+        response = client.futures_place_batch_order(batchOrders=json.dumps(batch))
+        print(response)
+
+def update_balance_and_pnl_by_custom_order_id(
+    client,
+    symbol: str,
+    trade_group_id: str,
+    thirdparty_id: str,
+    strategy_id: str,
+    trade_type: str = "EXIT",
+    update_profit_loss: bool = True,
+    use_api: bool = True
+) -> None:
+    """
+    透過自定義訂單ID更新策略餘額和已實現盈虧
+    
+    Args:
+        symbol: 交易幣種
+        trade_group_id: 交易組ID 
+        strategy_id: 策略ID
+        trade_type: 交易類型 (預設為 "EXIT")
+        update_profit_loss: 是否更新已實現盈虧 (預設為 True)
+        use_api: 是否使用API獲取成交資訊 (預設為 True)
+    """
+    try:
+        # 查詢相關訂單
+        trade = query_trade(trade_group_id)
+        if not trade or trade_group_id == "NA":
+            logger.warning(f"找不到交易組 {trade_group_id} 的訂單")
+            return
+
+        if use_api:
+            # 使用API查詢成交記錄
+            try:
+                trades = client.futures_account_trades(
+                    symbol=symbol,
+                    orderId=trade.thirdparty_id
+                )
+                # 計算已實現盈虧
+                total_realized_pnl = calculate_total_realized_pnl(trades, [trade.thirdparty_id])
+            except Exception as e:
+                logger.error(f"查詢訂單 {trade.thirdparty_id} 的交易記錄時發生錯誤: {str(e)}")
+                return
+        else:
+            max_attempts = 3
+            base_delay = 1  # 100毫秒
+            
+            for attempt in range(max_attempts):
+                try:
+                    with transaction.atomic():
+                        executions = OrderExecution.objects.select_for_update(nowait=True).filter(
+                            order_id=thirdparty_id,
+                            symbol=symbol
+                        ).order_by('execution_time')
+                        
+                        if executions:
+                            total_realized_pnl = sum(execution.realized_pnl - execution.commission for execution in executions)
+                            break
+                        else:
+                            if attempt <= max_attempts - 1:
+                                delay = base_delay * (2 ** attempt)  # 指數退避：0.1s, 0.2s, 0.4s
+                                logger.info(f"等待 OrderExecution 記錄，重試 {attempt + 1}/{max_attempts}，延遲 {delay}s")
+                                time.sleep(delay)
+                            else:
+                                logger.warning(f"找不到交易組 {thirdparty_id} 的成交記錄")
+                                return
+                except DatabaseError as e:
+                    if attempt < max_attempts - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.info(f"資料庫訪問衝突，重試 {attempt + 1}/{max_attempts}，延遲 {delay}s")
+                        time.sleep(delay)
+                    else:
+                        raise
+
+        logger.info(f"總已實現盈虧: {total_realized_pnl}")
+
+        # 根據參數決定是否更新已實現盈虧
+        if update_profit_loss:
+            # 更新策略餘額
+            update_result = update_account_balance(total_realized_pnl, strategy_id)
+            logger.info(f"更新帳戶餘額結果: {update_result}")
+            update_result = update_trade_profit_loss(
+                trade_group_id, 
+                total_realized_pnl, 
+                trade_type
+            )
+            logger.info(f"更新交易盈虧結果: {update_result}")
+
+    except Exception as e:
+        logger.error(f"更新餘額和盈虧時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+
+def create_order_execution(
+    strategy: 'Strategy',
+    order: dict,
+    execution_type: str
+) -> 'OrderExecution':
+    """
+    創建訂單執行記錄
+    
+    Args:
+        strategy: Strategy 模型實例
+        order: Binance WebSocket 訂單資訊
+        execution_type: 執行類型 (PARTIAL 或 FULL)
+    
+    Returns:
+        OrderExecution: 創建的訂單執行記錄實例
+    """
+    try:
+        execution = OrderExecution.objects.create(
+            strategy=strategy,
+            binance_execution_id=str(order['t']),  # 成交ID
+            execution_type=execution_type,
+            symbol=order['s'],
+            order_id=str(order['i']),
+            client_order_id=order['c'],
+            side=order['S'],
+            price=Decimal(str(order['L'])),  # 最後成交價格
+            quantity=Decimal(str(order['l'])),  # 最後成交數量
+            commission=Decimal(str(order['n'])),
+            commission_asset=order['N'],
+            realized_pnl=Decimal(str(order['rp'])),
+            execution_time=datetime.fromtimestamp(order['T'] / 1000.0)
+        )
+        
+        logger.info(
+            f"成功記錄訂單執行 - Order ID: {order['i']}, "
+            f"執行類型: {execution_type}, "
+            f"成交數量: {order['l']}, 成交價格: {order['L']}"
+        )
+        
+        return execution
+        
+    except Exception as e:
+        logger.error(f"創建訂單執行記錄時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+        raise
+
+def reduce_leverage(strategy: 'Strategy') -> None:
+    """
+    降低策略的槓桿率
+    
+    Args:
+        strategy: Strategy 模型實例
+    """
+    try:
+        # 計算新的槓桿率
+        new_leverage_rate = float(strategy.leverage_rate) * float(strategy.reduce_rate)
+        
+        # 更新策略的槓桿率
+        strategy.leverage_rate = Decimal(str(new_leverage_rate))
+        strategy.save()
+        
+        logger.info(f"""
+槓桿率調整:
+策略ID: {strategy.strategy_id}
+交易對: {strategy.symbol}
+調整後槓桿率: {strategy.leverage_rate}
+------------------------""")
+        
+    except Exception as e:
+        logger.error(f"調整槓桿率時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+
+
+def recover_leverage(strategy: 'Strategy') -> None:
+    """
+    恢復策略的槓桿率,但不超過1
+    
+    Args:
+        strategy: Strategy 模型實例
+    """
+    try:
+        # 計算新的槓桿率
+        new_leverage_rate = float(strategy.leverage_rate) * (1.0 + float(strategy.recover_rate))
+        
+        # 確保不超過上限1
+        new_leverage_rate = min(new_leverage_rate, 1.0)
+        
+        # 更新策略的槓桿率
+        strategy.leverage_rate = Decimal(str(new_leverage_rate))
+        strategy.save()
+        
+        logger.info(f"""
+槓桿率恢復:
+策略ID: {strategy.strategy_id}
+交易對: {strategy.symbol}
+調整後槓桿率: {strategy.leverage_rate}
+------------------------""")
+        
+    except Exception as e:
+        logger.error(f"恢復槓桿率時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+
+
+def risk_control(client, symbol: str, close_order: dict) -> bool:
+    """
+    執行風險控制平倉操作
+    
+    Args:
+        client: Binance client
+        symbol: 交易對符號
+        close_order: 平倉訂單資訊
+        
+    Returns:
+        bool: 平倉是否成功
+    """
+    try:
+        # 生成交易群組ID
+        trade_group_id = generate_trade_group_id()
+        close_order['newClientOrderId'] = trade_group_id
+        
+        # 執行平倉訂單
+        logger.warning(f"""
+開始執行風險控制平倉:
+交易對: {symbol}
+平倉方向: {close_order['side']}
+平倉數量: {close_order['quantity']}
+訂單類型: {close_order['type']}
+------------------------""")
+        
+        # 將訂單包裝成批次訂單格式
+        batch_payload = [close_order]
+        
+        # 執行批次訂單
+        response = client.futures_place_batch_order(
+            batchOrders=json.dumps(batch_payload)
+        )
+        
+        # 如果訂單成功執行，創建交易記錄
+        if response:
+            strategy = get_strategy_by_symbol(symbol)
+            
+            logger.info(f"風險控制平倉訂單執行成功: {response}")
+            
+            # 降低槓桿率
+            reduce_leverage(strategy)
+            return True
+            
+    except Exception as e:
+        logger.error(f"執行風險控制平倉時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+        return False
+        
+    return False
+
+
+def recover_all_active_strategy_leverage():
+    """每天午夜執行恢復所有活躍策略的槓桿率"""
+    try:
+        # 直接使用 filter 獲取 QuerySet
+        active_strategies = Strategy.objects.filter(status='ACTIVE')
+
+        logger.info(f"""
+=== 開始執行槓桿率恢復排程 ===
+活躍策略數量: {len(active_strategies)}
+------------------------""")
+
+        for strategy in active_strategies:
+            try:
+                recover_leverage(strategy)
+            except Exception as e:
+                logger.error(f"恢復策略 {strategy.strategy_id} 槓桿率時發生錯誤: {str(e)}")
+                continue
+
+        logger.info("=== 槓桿率恢復排程執行完成 ===")
+
+    except Exception as e:
+        logger.error(f"執行槓桿率恢復排程時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+
+def update_balance_from_execution(strategy_id: int, realized_pnl: float, commission: float) -> None:
+    """
+    根據成交記錄更新策略餘額
+    
+    Args:
+        strategy_id: 策略ID
+        realized_pnl: 已實現盈虧
+        commission: 手續費
+    """
+    try:
+        # 查找對應的帳戶餘額記錄
+        account_balance = AccountBalance.objects.get(strategy_id=strategy_id)
+        
+        # 轉換為 Decimal 並保持原始精度
+        realized_pnl_decimal = Decimal(str(realized_pnl))
+        commission_decimal = Decimal(str(commission))
+        
+        # 計算淨收益時不進行捨入
+        net_profit = realized_pnl_decimal - commission_decimal
+        
+        # 更新餘額時也保持原始精度
+        account_balance.balance += net_profit
+        account_balance.profit_loss = net_profit
+        account_balance.save()
+        
+        logger.info(f"已更新策略 {strategy_id} 的餘額，淨收益: {net_profit}")
+        
+    except AccountBalance.DoesNotExist:
+        logger.error(f"找不到策略 {strategy_id} 的帳戶餘額記錄")
+    except Exception as e:
+        logger.error(f"更新餘額時發生錯誤: {str(e)}")

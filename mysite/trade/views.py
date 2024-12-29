@@ -42,11 +42,24 @@ from .utils import (
     PositionSide,
     BinanceWebsocketClient,
     generate_grid_levels,
-    update_grid_positions_price
+    update_grid_positions_price,
+    generate_trade_group_id,
+    set_exchange_info_map,
+    grid_v2_lab,
+    update_all_future_positions,
+    create_trade,
+    get_strategy_by_symbol,
+    create_order_execution,
+    update_balance_and_pnl_by_custom_order_id,
+    risk_control,
+    recover_leverage,
+    recover_all_active_strategy_leverage,
+    update_balance_from_execution
 )
 
 notification_queue_entry = queue.Queue()
 notification_queue_exit = queue.Queue()
+balance_update_queue = queue.Queue()
 
 main_account = get_main_account_info()
 
@@ -99,16 +112,99 @@ def ws_callback(msg):
         
         if order['X'] in status_message:
             logger.info(status_message[order['X']])
-            logger.info(f"""
-訂單詳細信息:
-交易對: {order['s']}
-訂單方向: {order['S']}
-訂單類型: {order['o']}
-訂單價格: {order['p']}
-訂單數量: {order['q']}
-已成交數量: {order['z']}
-最後成交價格: {order['L']}
-""")
+            
+            # 當訂單部分成交或完全成交時記錄執行情況
+            if order['X'] in [OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED]:
+                try:
+                    symbol = order['s']
+                    strategy = get_strategy_by_symbol(symbol)
+                    execution_type = 'FULL' if order['X'] == OrderStatus.FILLED else 'PARTIAL'
+                    create_order_execution(strategy, order, execution_type)
+                    trade_group_id = order['c'] if order['c'] else "NA"
+                    # 根據訂單類型決定交易類型 - 移到外面確保一定會被定義
+                    trade_type = "GRID_V2_MARKET" if order['o'] == "MARKET" else "GRID_V2_LIMIT"
+                    
+                    # 更新餘額（已實現盈虧減去手續費）
+                    realized_pnl = float(order.get('rp', 0))  # 已實現盈虧
+                    commission = float(order.get('n', 0))     # 手續費
+                    
+                    # 調用新增的更新餘額函數
+                    update_balance_from_execution(
+                        strategy_id=strategy.strategy_id,
+                        realized_pnl=realized_pnl,
+                        commission=commission
+                    )
+
+                    # 如果是ONDOUSDT，執行額外操作
+                    if symbol == 'ONDOUSDT':
+                        grid_v2_lab(client, strategy.passphrase, 'ONDOUSDT')
+                        close_orders = update_all_future_positions(client)
+                        print(close_orders)
+                        for symbol, close_order in close_orders.items():
+                            if symbol == "ONDOUSDT":
+                                risk_control(client=client, symbol=symbol, close_order=close_order)
+                except Exception as e:
+                    logger.error(f"記錄交易時發生錯誤: {str(e)}")
+                    # update_balance_and_pnl_by_custom_order_id(
+                    #     client=client,
+                    #     symbol=symbol,
+                    #     trade_group_id=trade_group_id,
+                    #     thirdparty_id=str(order['i']),
+                    #     strategy_id=strategy.strategy_id,
+                    #     trade_type=trade_type,
+                    #     update_profit_loss=True,
+                    #     use_api=False
+                    # )
+                    # balance_update_queue.put({
+                    #     'client': client,
+                    #     'symbol': symbol,
+                    #     'trade_group_id': trade_group_id,
+                    #     'thirdparty_id': str(order['i']),
+                    #     'strategy_id': strategy.strategy_id,
+                    #     'trade_type': trade_type
+                    # })
+                except Exception as e:
+                    logger.error(f"記錄訂單執行時發生錯誤: {str(e)}")
+
+# def process_balance_updates():
+#     """定期處理餘額更新佇列"""
+#     while True:
+#         try:
+#             if not balance_update_queue.empty():
+#                 update_data = balance_update_queue.get()
+#                 max_retries = 2
+#                 retry_delay = 5  # 秒
+#
+#                 for attempt in range(max_retries):
+#                     try:
+#                         time.sleep(retry_delay)  # 等待資料寫入
+#                         update_balance_and_pnl_by_custom_order_id(
+#                             client=update_data['client'],
+#                             symbol=update_data['symbol'],
+#                             trade_group_id=update_data['trade_group_id'],
+#                             thirdparty_id=update_data['thirdparty_id'],
+#                             strategy_id=update_data['strategy_id'],
+#                             trade_type=update_data['trade_type'],
+#                             update_profit_loss=True,
+#                             use_api=False
+#                         )
+#                         break
+#                     except Exception as e:
+#                         logger.warning(f"更新餘額和盈虧重試 {attempt + 1}/{max_retries}: {str(e)}")
+#                         if attempt == max_retries - 1:
+#                             logger.error(f"更新餘額和盈虧失敗: {str(e)}")
+#
+#                 balance_update_queue.task_done()
+#             time.sleep(2)  # 避免過度佔用CPU
+#         except Exception as e:
+#             logger.error(f"處理餘額更新時發生錯誤: {str(e)}")
+#
+# balance_update_thread = threading.Thread(
+#     target=process_balance_updates,
+#     daemon=True,
+#     name="BalanceUpdateProcessor"
+# )
+# balance_update_thread.start()
 
 # 在應用啟動時初始化 WebSocket
 initialize_websocket()
@@ -183,13 +279,23 @@ for symbol_info in exchange_info["symbols"]:
     symbol = symbol_info["symbol"]
     price_precision = symbol_info["pricePrecision"]
     quantity_precision = symbol_info["quantityPrecision"]
+    
+    # 從 filters 中獲取 tick size
+    tick_size = None
+    for filter in symbol_info["filters"]:
+        if filter["filterType"] == "PRICE_FILTER":
+            tick_size = float(filter["tickSize"])
+            break
+            
     exchange_info_map[symbol] = {
         "pricePrecision": price_precision,
-        "quantityPrecision": quantity_precision
+        "quantityPrecision": quantity_precision,
+        "tickSize": tick_size
     }
+set_exchange_info_map(exchange_info_map)
 
 # 打印結果
-logger.info(exchange_info_map)
+# logger.info(exchange_info_map)
 # 打印目前策略
 strategy_list()
 
@@ -426,7 +532,7 @@ def open_grid_position(
             grid_position = create_new_grid_position(strategy=strategy, grid_index=grid_index)
 
         # 建立trade_group_id
-        trade_group_id = uuid.uuid4()
+        trade_group_id = generate_trade_group_id()
         # 目前沒有設止盈止損 靠訊號關單
         create_grid_order(
             req_id=req_id,
@@ -493,7 +599,7 @@ def open_grid_position_v2(
             return False
 
         # 生成trade_group_id
-        trade_group_id = uuid.uuid4()
+        trade_group_id = generate_trade_group_id()
 
         # 獲取symbol資訊
         symbol_info = exchange_info_map[notification_symbol]
@@ -1379,7 +1485,7 @@ def create_swing_order(
         logger.info(f"{req_id} - Unable to open a position: the quantity becomes 0 after precision adjustment")
 
     # 建立trade_group_id
-    trade_group_id = uuid.uuid4()
+    trade_group_id = generate_trade_group_id()
     logger.info(f"{req_id} - trade_group_id {trade_group_id}")
 
     # 先計算前三個止盈點的訂單量
@@ -1611,6 +1717,9 @@ def run_schedule():
     # 每 5 秒運行一次
     schedule.every(5).seconds.do(handle_webhook_entry_schedule)
     schedule.every(5).seconds.do(handle_webhook_exit_schedule)
+    
+    # 新增每天午夜執行的槓桿率恢復排程
+    schedule.every().day.at("00:00").do(recover_all_active_strategy_leverage)
 
     while True:
         schedule.run_pending()
@@ -1668,3 +1777,4 @@ def update_balance_and_pnl(
     # 根據參數決定是否更新已實現盈虧
     if update_profit_loss:
         update_trade_profit_loss(trade_group_id, total_realized_pnl, trade_type)
+

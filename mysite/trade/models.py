@@ -35,6 +35,10 @@ class Strategy(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     symbol = models.TextField(blank=True, null=True)
+    leverage_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    reduce_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    hold_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    recover_rate = models.DecimalField(max_digits=10, decimal_places=2)
 
     class Meta:
         db_table = 'strategies'
@@ -56,7 +60,7 @@ class Trade(models.Model):
     trade_side = models.CharField(max_length=4)
     trade_type = models.CharField(max_length=20)
     quantity = models.DecimalField(max_digits=10, decimal_places=2)
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    price = models.DecimalField(max_digits=20, decimal_places=8)
     profit_loss = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     cumulative_profit_loss = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     trade_group_id = models.CharField(max_length=36, blank=True, null=True)
@@ -81,11 +85,14 @@ class Trade(models.Model):
 class AccountBalance(models.Model):
     balance_id = models.AutoField(primary_key=True)
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
-    balance = models.DecimalField(max_digits=10, decimal_places=2)
+    balance = models.DecimalField(max_digits=20, decimal_places=8)
     equity = models.DecimalField(max_digits=10, decimal_places=2)
     available_margin = models.DecimalField(max_digits=10, decimal_places=2)
-    used_margin = models.DecimalField(max_digits=10, decimal_places=2)
-    profit_loss = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    used_margin = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+    unrealized_pnl = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+    position_value = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+    position_amount = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+    profit_loss = models.DecimalField(max_digits=20, decimal_places=8, default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -104,9 +111,9 @@ class GridPosition(models.Model):
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE, related_name='grid_positions')
     grid_index = models.IntegerField()
     quantity = models.DecimalField(max_digits=10, decimal_places=4)
-    entry_price = models.DecimalField(max_digits=10, decimal_places=2)
-    exit_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
-    stop_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
+    entry_price = models.DecimalField(max_digits=20, decimal_places=8)
+    exit_price = models.DecimalField(max_digits=20, decimal_places=8, blank=True, null=True)
+    stop_price = models.DecimalField(max_digits=20, decimal_places=8, blank=True, null=True)
     is_open = models.BooleanField(default=True)
     trade_group_id = models.CharField(max_length=36, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -122,3 +129,44 @@ class GridPosition(models.Model):
                 f"Stop Price: {self.stop_price}, Is Open: {self.is_open}, "
                 f"Trade Group ID: {self.trade_group_id}, "
                 f"Created At: {self.created_at}, Updated At: {self.updated_at}")
+
+class OrderExecution(models.Model):
+    """訂單執行記錄"""
+    
+    class ExecutionType(models.TextChoices):
+        PARTIAL = 'PARTIAL', '部分成交'
+        FULL = 'FULL', '完全成交'
+    
+    # 關聯欄位
+    strategy = models.ForeignKey('Strategy', on_delete=models.PROTECT, related_name='order_executions')
+    
+    # 執行資訊
+    execution_id = models.BigAutoField(primary_key=True)
+    binance_execution_id = models.CharField(max_length=50, unique=True)  # 幣安成交ID
+    execution_type = models.CharField(max_length=10, choices=ExecutionType.choices)
+    symbol = models.CharField(max_length=20)
+    order_id = models.CharField(max_length=50)  # Binance訂單ID
+    client_order_id = models.CharField(max_length=50)  # 客戶端訂單ID
+    side = models.CharField(max_length=10)  # BUY/SELL
+    price = models.DecimalField(max_digits=20, decimal_places=8)
+    quantity = models.DecimalField(max_digits=20, decimal_places=8)  # 本次成交數量
+    commission = models.DecimalField(max_digits=20, decimal_places=8)  # 手續費
+    commission_asset = models.CharField(max_length=10)  # 手續費資產
+    realized_pnl = models.DecimalField(max_digits=20, decimal_places=8)  # 已實現盈虧
+    
+    # 時間戳記與備註
+    execution_time = models.DateTimeField()  # 成交時間
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'order_executions'
+        ordering = ['-execution_time']
+        indexes = [
+            models.Index(fields=['strategy', 'symbol', 'execution_time']),
+            models.Index(fields=['order_id']),
+            models.Index(fields=['client_order_id'])
+        ]
+
+    def __str__(self):
+        return f"{self.symbol} {self.execution_type} - {self.quantity}@{self.price}"

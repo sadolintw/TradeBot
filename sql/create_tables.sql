@@ -112,3 +112,60 @@ CREATE TRIGGER update_account_info_modtime BEFORE UPDATE ON account_info FOR EAC
 CREATE TRIGGER update_strategies_modtime BEFORE UPDATE ON strategies FOR EACH ROW EXECUTE FUNCTION trigger_update_timestamp();
 CREATE TRIGGER update_trades_modtime BEFORE UPDATE ON trades FOR EACH ROW EXECUTE FUNCTION trigger_update_timestamp();
 CREATE TRIGGER update_account_balance_modtime BEFORE UPDATE ON account_balance FOR EACH ROW EXECUTE FUNCTION trigger_update_timestamp();
+
+
+-- ORDER_EXECUTIONS
+-- 建立 order_executions 表
+CREATE TABLE public.order_executions (
+    execution_id serial8 NOT NULL,
+    strategy_id int4 NOT NULL,
+    binance_execution_id varchar(50) NOT NULL UNIQUE,
+    execution_type varchar(10) NOT NULL CHECK (execution_type IN ('PARTIAL', 'FULL')),
+    symbol varchar(20) NOT NULL,
+    order_id varchar(50) NOT NULL,
+    client_order_id varchar(50) NOT NULL,
+    side varchar(10) NOT NULL,
+    price numeric(20, 8) NOT NULL,
+    quantity numeric(20, 8) NOT NULL,
+    commission numeric(20, 8) NOT NULL,
+    commission_asset varchar(10) NOT NULL,
+    realized_pnl numeric(20, 8) NOT NULL,
+    execution_time timestamp NOT NULL,
+    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp DEFAULT CURRENT_TIMESTAMP,
+    memo varchar NULL,
+
+    CONSTRAINT order_executions_pkey PRIMARY KEY (execution_id),
+    CONSTRAINT order_executions_strategy_id_fkey
+        FOREIGN KEY (strategy_id)
+        REFERENCES public.strategies(strategy_id)
+);
+
+-- 建立索引
+CREATE INDEX idx_order_executions_strategy_symbol_time
+    ON public.order_executions (strategy_id, symbol, execution_time);
+
+CREATE INDEX idx_order_executions_order_id
+    ON public.order_executions (order_id);
+
+CREATE INDEX idx_order_executions_client_order_id
+    ON public.order_executions (client_order_id);
+
+CREATE INDEX idx_order_executions_execution_time_brin
+    ON public.order_executions USING BRIN (execution_time);
+
+-- 建立更新時間戳的觸發器
+CREATE TRIGGER update_order_executions_modtime
+    BEFORE UPDATE ON public.order_executions
+    FOR EACH ROW
+    EXECUTE FUNCTION trigger_update_timestamp();
+
+-- 建立註解
+COMMENT ON TABLE public.order_executions IS '訂單執行記錄表';
+COMMENT ON COLUMN public.order_executions.binance_execution_id IS '幣安成交ID';
+COMMENT ON COLUMN public.order_executions.execution_type IS '執行類型 (PARTIAL=部分成交, FULL=完全成交)';
+COMMENT ON COLUMN public.order_executions.price IS '成交價格';
+COMMENT ON COLUMN public.order_executions.quantity IS '本次成交數量';
+COMMENT ON COLUMN public.order_executions.commission IS '手續費';
+COMMENT ON COLUMN public.order_executions.commission_asset IS '手續費資產類型';
+COMMENT ON COLUMN public.order_executions.realized_pnl IS '已實現盈虧';
