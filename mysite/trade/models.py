@@ -170,3 +170,24 @@ class OrderExecution(models.Model):
 
     def __str__(self):
         return f"{self.symbol} {self.execution_type} - {self.quantity}@{self.price}"
+
+class AccountBalanceHistory(models.Model):
+    """帳戶餘額歷史記錄"""
+    history_id = models.BigAutoField(primary_key=True)
+    strategy = models.ForeignKey('Strategy', on_delete=models.PROTECT)
+    balance = models.DecimalField(max_digits=20, decimal_places=8)
+    equity = models.DecimalField(max_digits=20, decimal_places=8)
+    available_margin = models.DecimalField(max_digits=20, decimal_places=8)
+    used_margin = models.DecimalField(max_digits=20, decimal_places=8)
+    unrealized_pnl = models.DecimalField(max_digits=20, decimal_places=8)
+    position_value = models.DecimalField(max_digits=20, decimal_places=8, null=True)
+    position_amount = models.DecimalField(max_digits=20, decimal_places=8, null=True)
+    snapshot_time = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'account_balance_history'
+        ordering = ['-snapshot_time']
+        indexes = [
+            models.Index(fields=['strategy', 'snapshot_time']),
+        ]

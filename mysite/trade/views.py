@@ -54,7 +54,9 @@ from .utils import (
     risk_control,
     recover_leverage,
     recover_all_active_strategy_leverage,
-    update_balance_from_execution
+    update_balance_from_execution,
+    create_trade_from_ws_order,
+    create_balance_history_snapshot
 )
 
 notification_queue_entry = queue.Queue()
@@ -120,10 +122,12 @@ def ws_callback(msg):
                     strategy = get_strategy_by_symbol(symbol)
                     execution_type = 'FULL' if order['X'] == OrderStatus.FILLED else 'PARTIAL'
                     create_order_execution(strategy, order, execution_type)
-                    trade_group_id = order['c'] if order['c'] else "NA"
                     # 根據訂單類型決定交易類型 - 移到外面確保一定會被定義
                     trade_type = "GRID_V2_MARKET" if order['o'] == "MARKET" else "GRID_V2_LIMIT"
                     
+                    # 創建交易記錄
+                    create_trade_from_ws_order(order, strategy, trade_type)
+
                     # 更新餘額（已實現盈虧減去手續費）
                     realized_pnl = float(order.get('rp', 0))  # 已實現盈虧
                     commission = float(order.get('n', 0))     # 手續費
@@ -135,34 +139,17 @@ def ws_callback(msg):
                         commission=commission
                     )
 
+                    v2 = ['ONDOUSDT', 'DOGEUSDT', 'WIFUSDT']
+
                     # 如果是ONDOUSDT，執行額外操作
-                    if symbol == 'ONDOUSDT':
-                        grid_v2_lab(client, strategy.passphrase, 'ONDOUSDT')
+                    if symbol in v2:
+                        grid_v2_lab(client, strategy.passphrase, symbol)
                         close_orders = update_all_future_positions(client)
-                        print(close_orders)
                         for symbol, close_order in close_orders.items():
-                            if symbol == "ONDOUSDT":
+                            if symbol in v2:
                                 risk_control(client=client, symbol=symbol, close_order=close_order)
                 except Exception as e:
                     logger.error(f"記錄交易時發生錯誤: {str(e)}")
-                    # update_balance_and_pnl_by_custom_order_id(
-                    #     client=client,
-                    #     symbol=symbol,
-                    #     trade_group_id=trade_group_id,
-                    #     thirdparty_id=str(order['i']),
-                    #     strategy_id=strategy.strategy_id,
-                    #     trade_type=trade_type,
-                    #     update_profit_loss=True,
-                    #     use_api=False
-                    # )
-                    # balance_update_queue.put({
-                    #     'client': client,
-                    #     'symbol': symbol,
-                    #     'trade_group_id': trade_group_id,
-                    #     'thirdparty_id': str(order['i']),
-                    #     'strategy_id': strategy.strategy_id,
-                    #     'trade_type': trade_type
-                    # })
                 except Exception as e:
                     logger.error(f"記錄訂單執行時發生錯誤: {str(e)}")
 
@@ -506,6 +493,7 @@ def open_grid_position(
         )
         change_leverage(req_id, strategy_client, notification_symbol, leverage)
         balance = find_balance_by_strategy_id(strategy.strategy_id)
+        leverage_rate = strategy.leverage_rate
         if balance is not None:
             usdt = balance.balance
             logger.info(f"{req_id} - has corresponding balance {usdt}")
@@ -514,7 +502,7 @@ def open_grid_position(
 
         usdt = str(usdt)
         raw_quantity = 0 if usdt is None else math.floor(
-            100000 * float(usdt) * int(weight) / int(total_weight) / float(notification_entry)) / 100000
+            100000 * float(usdt) * float(leverage_rate) * int(weight) / int(total_weight) / float(notification_entry)) / 100000
         quantity = round(raw_quantity * int(leverage), _quantity_precision)
         logger.info(f"{req_id} - raw_quantity {raw_quantity}")
         logger.info(f"{req_id} - quantity {quantity} quantity_precision {_quantity_precision}")
@@ -725,14 +713,15 @@ def close_grid_position(
         if grid_exit_trade is not None:
             start_time = str((grid_exit_trade.created_at_timestamp - 3600) * 1000)
             time.sleep(get_account_trade_delay)
-            update_balance_and_pnl(
-                req_id=req_id,
-                symbol=notification_symbol,
-                trade_group_id=grid_position_to_close.trade_group_id,
-                strategy_id=strategy.strategy_id,
-                trade_type="GRID_EXIT",
-                start_time=start_time
-            )
+            # 改由WS更新
+            # update_balance_and_pnl(
+            #     req_id=req_id,
+            #     symbol=notification_symbol,
+            #     trade_group_id=grid_position_to_close.trade_group_id,
+            #     strategy_id=strategy.strategy_id,
+            #     trade_type="GRID_EXIT",
+            #     start_time=start_time
+            # )
         else:
             logger.info(f"{req_id} - not grid exit record")
             return
@@ -1720,7 +1709,11 @@ def run_schedule():
     
     # 新增每天午夜執行的槓桿率恢復排程
     schedule.every().day.at("00:00").do(recover_all_active_strategy_leverage)
-
+    
+    # 每半小時執行一次 (在每小時的 0 分和 30 分執行)
+    schedule.every().hour.at(":00").do(create_balance_history_snapshot)
+    schedule.every().hour.at(":30").do(create_balance_history_snapshot)
+    
     while True:
         schedule.run_pending()
         time.sleep(1)

@@ -6,7 +6,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from binance.exceptions import BinanceAPIException  # 新增 BinanceAPIException
-from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition, OrderExecution
+from .models import AccountInfo, Strategy, AccountBalance, Trade, GridPosition, OrderExecution, AccountBalanceHistory
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from binance import ThreadedWebsocketManager
 from django.db.utils import DatabaseError
+from collections import defaultdict
 
 
 
@@ -924,9 +925,9 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logge
         balance = get_balance_by_symbol(symbol)
         
         # 將所有數值轉換為 float 進行計算
-        quantity_by_balance = float(balance.balance) * 0.015 * leverage * float(leverage_rate) / mark_price  # 根據餘額計算
-        quantity_by_min_notional = int(5 / mark_price + 1)  # 最小名義價值5U
-        quantity = max(quantity_by_balance, quantity_by_min_notional)
+        quantity_balance = float(balance.balance) * 0.02 * leverage * float(leverage_rate) / mark_price  # 根據餘額計算
+        quantity_notation = int(5.0 / float(mark_price)) + 1
+        quantity = max(quantity_notation, quantity_notation)
         # logger.info(f"Strategy info - ID: {strategy.strategy_id}, Symbol: {symbol}")
         
         # 取得所有網格倉位並檢查
@@ -961,6 +962,11 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logge
             # - 高於當前網格掛賣單，成交後形成空倉
             if position.grid_index < current_grid_index:
                 # logger.info(f"Creating BUY order at grid {position.grid_index}")
+                if quantity * float(position.entry_price) < 5.0: # 最小名義價值5U
+                    new_quantity = int(5.0 / float(position.entry_price))+1
+                    order.update({
+                        'quantity': format_decimal_symbol_quantity(symbol, new_quantity)
+                    })
                 order.update({
                     'price': format_decimal_symbol_price(symbol, position.entry_price),
                     'side': 'BUY'
@@ -1104,6 +1110,7 @@ def update_all_future_positions(client):
 持倉數量: {pos['position_amount']} ({"多倉" if pos['position_amount'] > 0 else "空倉"})
 持倉均價: {pos['entry_price']}
 持倉價值: {pos['position_value']:.8f} USDT
+持倉上限: {strategy.hold_rate}
 持倉比例 {hold_rate:.8} {"(超過限制)" if hold_rate > strategy.hold_rate else ""}
 未實現盈虧: {pos['unrealized_pnl']}
 槓桿倍數: {pos['leverage']}x
@@ -1198,25 +1205,65 @@ def get_current_price(client, symbol):
         logger.error(f"獲取 {symbol} 價格時發生未預期錯誤: {str(e)}")
         return None
 
+# 使用字典存儲每個 symbol 的鎖
+_symbol_locks = defaultdict(threading.Lock)
+
 def grid_v2_lab(client, passphrase, symbol):
-    client.futures_cancel_all_open_orders(symbol=symbol)
-    price = get_current_price(client, symbol)
-    mark_price = price['mark_price']
-    upper_bound = mark_price * (1 + 0.025)
-    lower_bound = mark_price * (1 - 0.025)
-    levels = generate_grid_levels(lower_bound, upper_bound, 10, symbol)
-    logger.info(levels)
-    strategy = find_strategy_by_passphrase(passphrase)
-    leverage = strategy.leverage
-    client.futures_change_leverage(symbol=symbol, leverage=leverage)
-    update_grid_positions_price(strategy, levels)
-    batch_payloads = grid_v2_create_batch_payload(strategy=strategy, current_grid_index=5, mark_price=mark_price)
-    # print(batch_payloads)
-    # 分批發送訂單
-    for batch in batch_payloads:
-        logger.info(f"Sending batch order: {json.dumps(batch)}")
-        response = client.futures_place_batch_order(batchOrders=json.dumps(batch))
-        print(response)
+    """
+    網格交易實驗方法，使用基於 symbol 的同步鎖
+    
+    Args:
+        client: Binance client
+        passphrase: 策略密碼
+        symbol: 交易對符號
+    """
+    # 獲取該 symbol 的專屬鎖
+    with _symbol_locks[symbol]:
+        try:
+            logger.info(f"開始執行網格交易實驗 - Symbol: {symbol}")
+            
+            # 取消所有掛單，最多重試3次
+            max_retries = 3
+            retry_delay = 0.1
+            
+            for attempt in range(max_retries):
+                try:
+                    client.futures_cancel_all_open_orders(symbol=symbol)
+                    logger.info(f"成功取消 {symbol} 所有掛單")
+                    break
+                    
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(f"取消掛單失敗 (嘗試 {attempt + 1}/{max_retries}): {str(e)}")
+                        logger.info(f"等待 {wait_time} 秒後重試...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"取消掛單最終失敗: {str(e)}")
+                        raise
+
+            price = get_current_price(client, symbol)
+            mark_price = price['mark_price']
+            upper_bound = mark_price * (1 + 0.025)
+            lower_bound = mark_price * (1 - 0.025)
+            levels = generate_grid_levels(lower_bound, upper_bound, 10, symbol)
+            logger.info(levels)
+            strategy = find_strategy_by_passphrase(passphrase)
+            leverage = strategy.leverage
+            # client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            update_grid_positions_price(strategy, levels)
+            batch_payloads = grid_v2_create_batch_payload(strategy=strategy, current_grid_index=5, mark_price=mark_price)
+            print(f'batch_payloads {batch_payloads}')
+            # 分批發送訂單
+            for batch in batch_payloads:
+                logger.info(f"Sending batch order: {json.dumps(batch)}")
+                response = client.futures_place_batch_order(batchOrders=json.dumps(batch))
+                print(response)
+
+        except Exception as e:
+            logger.error(f"網格交易實驗執行失敗 - Symbol: {symbol}, Error: {str(e)}")
+            logger.error("錯誤詳情:", exc_info=True)
+            raise
 
 def update_balance_and_pnl_by_custom_order_id(
     client,
@@ -1423,7 +1470,7 @@ def risk_control(client, symbol: str, close_order: dict) -> bool:
         bool: 平倉是否成功
     """
     try:
-        # 生成交易群組ID
+        # 優先使用傳入的 newClientOrderId，若沒有則生成新的
         trade_group_id = generate_trade_group_id()
         close_order['newClientOrderId'] = trade_group_id
         
@@ -1434,6 +1481,7 @@ def risk_control(client, symbol: str, close_order: dict) -> bool:
 平倉方向: {close_order['side']}
 平倉數量: {close_order['quantity']}
 訂單類型: {close_order['type']}
+交易組ID: {trade_group_id}
 ------------------------""")
         
         # 將訂單包裝成批次訂單格式
@@ -1447,6 +1495,18 @@ def risk_control(client, symbol: str, close_order: dict) -> bool:
         # 如果訂單成功執行，創建交易記錄
         if response:
             strategy = get_strategy_by_symbol(symbol)
+            
+            # 創建交易記錄
+            Trade.objects.create(
+                strategy_id=strategy.strategy_id,
+                trade_group_id=trade_group_id+"_r",
+                thirdparty_id=response[0]['orderId'],
+                symbol=symbol,
+                side=close_order['side'],
+                type=close_order['type'],
+                quantity=close_order['quantity'],
+                trade_type="RISK_CONTROL",  # 標記為風險控制交易
+            )
             
             logger.info(f"風險控制平倉訂單執行成功: {response}")
             
@@ -1517,3 +1577,76 @@ def update_balance_from_execution(strategy_id: int, realized_pnl: float, commiss
         logger.error(f"找不到策略 {strategy_id} 的帳戶餘額記錄")
     except Exception as e:
         logger.error(f"更新餘額時發生錯誤: {str(e)}")
+
+def create_trade_from_ws_order(order: dict, strategy, trade_type: str) -> None:
+    """
+    從 WebSocket 訂單消息創建交易記錄
+    
+    Args:
+        order: WebSocket 訂單消息
+        strategy: 策略對象
+        trade_type: 交易類型
+    """
+    try:
+        trade_group_id = order.get('c', 'NA')  # 從訂單中獲取 clientOrderId
+        
+        Trade.objects.create(
+            strategy=strategy,
+            trade_group_id=trade_group_id,
+            thirdparty_id=order['i'],  # orderId
+            symbol=order['s'],         # symbol
+            trade_side=order['S'],     # side
+            trade_type=trade_type,
+            quantity=Decimal(str(order['l'])),  # 最後成交數量
+            price=Decimal(str(order['L'])),     # 最後成交價格
+            profit_loss=Decimal(str(order.get('rp', '0'))),  # 已實現盈虧
+            cumulative_profit_loss=Decimal('0')  # 初始化為0
+        )
+        
+        logger.info(f"成功創建交易記錄 - Order ID: {order['i']}, Symbol: {order['s']}")
+        
+    except Exception as e:
+        logger.error(f"創建交易記錄時發生錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+
+def create_balance_history_snapshot():
+    """
+    為所有活躍策略創建餘額歷史快照
+    """
+    try:
+        # 獲取所有活躍策略
+        active_strategies = Strategy.objects.filter(status='ACTIVE')
+        snapshots = []
+        
+        for strategy in active_strategies:
+            try:
+                # 獲取當前餘額記錄
+                balance = AccountBalance.objects.get(strategy=strategy)
+                
+                # 創建歷史記錄，為可能為空的欄位設置預設值
+                snapshot = AccountBalanceHistory(
+                    strategy=strategy,
+                    balance=balance.balance or Decimal('0'),
+                    equity=balance.equity or Decimal('1.0'),
+                    available_margin=balance.available_margin or Decimal('0'),
+                    used_margin=balance.used_margin or Decimal('0'),
+                    unrealized_pnl=balance.unrealized_pnl or Decimal('0'),
+                    position_value=balance.position_value,  # 允許為 null
+                    position_amount=balance.position_amount  # 允許為 null
+                )
+                snapshots.append(snapshot)
+                
+            except AccountBalance.DoesNotExist:
+                logger.warning(f"找不到策略 {strategy.strategy_id} 的餘額記錄")
+                continue
+            except Exception as e:
+                logger.error(f"處理策略 {strategy.strategy_id} 的餘額快照時發生錯誤: {str(e)}")
+                continue
+        
+        # 批量創建歷史記錄
+        if snapshots:
+            AccountBalanceHistory.objects.bulk_create(snapshots)
+            logger.info(f"成功創建 {len(snapshots)} 筆餘額歷史記錄")
+            
+    except Exception as e:
+        logger.error(f"創建餘額歷史快照時發生錯誤: {str(e)}")
