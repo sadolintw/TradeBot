@@ -16,33 +16,65 @@ import threading
 from binance import ThreadedWebsocketManager
 from django.db.utils import DatabaseError
 from collections import defaultdict
-
+import math
+import queue
+from logging.handlers import QueueHandler, QueueListener
+import re
 
 
 def get_monthly_rotating_logger(logger_name, log_dir='logs'):
     logger = logging.getLogger(logger_name)
-
-    # 检查是否已经添加了处理器
+    
     if not logger.handlers:
-        print("logger not found")
         logger.setLevel(logging.INFO)
 
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
 
+        # 使用當前時間建立檔案名
         current_month = datetime.now().strftime("%Y-%m")
         log_filename = f'{log_dir}/my_trade_system_{current_month}.log'
 
-        handler = TimedRotatingFileHandler(log_filename, when='MIDNIGHT', interval=1, backupCount=0)
-        handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] [%(funcName)s] [%(lineno)d] - %(message)s'))
-
+        # 修改 TimedRotatingFileHandler 的設置
+        handler = TimedRotatingFileHandler(
+            log_filename,
+            when='midnight',
+            interval=1,
+            backupCount=30,  # 保留30天的日誌
+            encoding='utf-8',
+            delay=True
+        )
+        
+        # 自定義檔案名格式
+        handler.suffix = "%Y-%m-%d"
+        # 使用 re.compile 來創建正則表達式對象
+        handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        
+        # 設定檔案權限
+        if os.name != 'nt':  # 非Windows系統
+            os.chmod(log_filename, 0o666)
+            
+        formatter = logging.Formatter(
+            '[%(asctime)s] [%(levelname)s] [%(funcName)s] [%(lineno)d] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        handler.setFormatter(formatter)
+        
+        # 新增 Queue Handler 處理多線程
+        queue_handler = QueueHandler(queue.Queue())
+        queue_listener = QueueListener(
+            queue_handler.queue,
+            handler,
+            respect_handler_level=True
+        )
+        queue_listener.start()
+        
+        logger.addHandler(queue_handler)
+        
+        # 新增控制台輸出
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] [%(funcName)s] [%(lineno)d] - %(message)s'))
-
-        logger.addHandler(handler)
+        console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
-    else:
-        print('logger found ')
 
     return logger
 
@@ -905,6 +937,15 @@ def generate_trade_group_id():
     uuid_str = str(uuid.uuid4()).split('-')[-1]  # 取最後一段
     return f"{date_str}-{uuid_str}"
 
+def get_grid_quantity(symbol, balance, leverage, leverage_rate, mark_price, min_notional=5.0, balance_rate=0.003):
+    # balance_amount = min(float(balance.balance), float(balance.available_margin))
+    balance_amount = float(balance.available_margin)
+    quantity_by_balance = balance_amount * balance_rate * leverage * float(leverage_rate) / mark_price  # 根據餘額計算
+    quantity_by_min_notional = int(min_notional / float(mark_price)) + 1
+    quantity = max(quantity_by_min_notional, quantity_by_balance)
+    # logger.info(f"{leverage} {leverage_rate} {mark_price}")
+    return format_decimal_symbol_quantity(symbol, quantity)
+
 def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logger=logger):
     """
     生成網格交易的批次掛單資料，每批最多5個訂單
@@ -913,6 +954,7 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logge
     Args:
         strategy: 策略實例
         current_grid_index: 當前網格索引
+        mark_price: 當前標記價格
         
     Returns:
         list: 批次掛單資料陣列的列表，每個陣列最多包含5個訂單
@@ -920,15 +962,7 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logge
     try:
         # 檢查策略資訊
         symbol = strategy.symbol
-        leverage = strategy.leverage
-        leverage_rate = strategy.leverage_rate
         balance = get_balance_by_symbol(symbol)
-        
-        # 將所有數值轉換為 float 進行計算
-        quantity_balance = float(balance.balance) * 0.02 * leverage * float(leverage_rate) / mark_price  # 根據餘額計算
-        quantity_notation = int(5.0 / float(mark_price)) + 1
-        quantity = max(quantity_notation, quantity_notation)
-        # logger.info(f"Strategy info - ID: {strategy.strategy_id}, Symbol: {symbol}")
         
         # 取得所有網格倉位並檢查
         positions = get_grid_positions_by_strategy(strategy=strategy)
@@ -948,35 +982,39 @@ def grid_v2_create_batch_payload(strategy, current_grid_index, mark_price, logge
             if position.grid_index == current_grid_index:
                 continue
             
+            # 根據網格位置決定交易方向
+            side = 'BUY' if position.grid_index < current_grid_index else 'SELL'
+            # 根據目前持倉方向和交易方向決定槓桿率
+            # leverage_rate = float(strategy.leverage_rate if side == 'BUY' else strategy.short_leverage_rate)
+            if balance.position_amount < 0:  # 目前持空單
+                leverage_rate = float(strategy.short_leverage_rate if side == 'SELL' else 1.0)
+            else:  # 目前持多單或無倉位
+                leverage_rate = float(strategy.leverage_rate if side == 'BUY' else 1.0)
+            order_price = position.entry_price if side == 'BUY' else position.exit_price
+            
+            # 使用 get_grid_quantity 計算數量
+            quantity = get_grid_quantity(
+                symbol=symbol,
+                balance=balance,
+                leverage=strategy.leverage,
+                leverage_rate=leverage_rate,
+                mark_price=float(order_price)  # 根據交易方向使用不同價格
+            )
+            
             # 基本訂單資訊
             order = {
                 'symbol': strategy.symbol,
                 'type': 'LIMIT',
                 'timeInForce': 'GTC',
-                'quantity': format_decimal_symbol_quantity(symbol, quantity),
+                'quantity': quantity,
                 'newClientOrderId': f"{trade_group_id}_{position.grid_index}",
             }
             
-            # 單向持倉模式下:
-            # - 低於當前網格掛買單，成交後形成多倉
-            # - 高於當前網格掛賣單，成交後形成空倉
-            if position.grid_index < current_grid_index:
-                # logger.info(f"Creating BUY order at grid {position.grid_index}")
-                if quantity * float(position.entry_price) < 5.0: # 最小名義價值5U
-                    new_quantity = int(5.0 / float(position.entry_price))+1
-                    order.update({
-                        'quantity': format_decimal_symbol_quantity(symbol, new_quantity)
-                    })
-                order.update({
-                    'price': format_decimal_symbol_price(symbol, position.entry_price),
-                    'side': 'BUY'
-                })
-            else:
-                # logger.info(f"Creating SELL order at grid {position.grid_index}")
-                order.update({
-                    'price': format_decimal_symbol_price(symbol, position.entry_price),
-                    'side': 'SELL'
-                })
+            # 設定價格和方向
+            order.update({
+                'price': format_decimal_symbol_price(symbol, order_price),
+                'side': side
+            })
             
             current_batch.append(order)
             # logger.info(f"Added order to current batch: {order} (position {i+1})")
@@ -1080,13 +1118,19 @@ def update_all_future_positions(client):
         if balance:
             margin = pos['margin']
             current_balance = float(balance.balance)
-            hold_rate = margin/current_balance
+            available_margin = float(balance.available_margin)
+            denominator = max(current_balance, available_margin)
+            hold_rate = margin/denominator if denominator > 0 else 0
             position_amount = float(pos['position_amount'])
             
-            # 檢查是否超過策略設定的 hold_rate
-            if hold_rate > strategy.hold_rate:
-                # 計算需要平倉的數量（一半持倉）
-                close_quantity = abs(position_amount) / 2
+            # 根據持倉方向判斷使用的持倉率限制
+            is_short = position_amount < 0
+            max_hold_rate = strategy.short_hold_rate if is_short else strategy.hold_rate
+            
+            # 檢查是否超過策略設定的持倉率
+            if hold_rate > max_hold_rate:
+                # 計算需要平倉的數量（根據策略設定的縮減率）
+                close_quantity = abs(position_amount) * float(strategy.hold_reduce_rate)
                 
                 # 決定平倉方向
                 close_side = 'SELL' if position_amount > 0 else 'BUY'
@@ -1107,11 +1151,11 @@ def update_all_future_positions(client):
 {pos['symbol']}:
 已投入保證金: {pos['margin']:.8f} USDT
 剩餘資金: {balance.balance:.8f} USDT
-持倉數量: {pos['position_amount']} ({"多倉" if pos['position_amount'] > 0 else "空倉"})
+持倉數量: {pos['position_amount']} ({"空倉" if float(pos['position_amount']) < 0 else "多倉"})
 持倉均價: {pos['entry_price']}
 持倉價值: {pos['position_value']:.8f} USDT
-持倉上限: {strategy.hold_rate}
-持倉比例 {hold_rate:.8} {"(超過限制)" if hold_rate > strategy.hold_rate else ""}
+持倉上限: {strategy.short_hold_rate if float(pos['position_amount']) < 0 else strategy.hold_rate}
+持倉比例 {hold_rate:.8} {"(超過限制)" if hold_rate > (strategy.short_hold_rate if float(pos['position_amount']) < 0 else strategy.hold_rate) else ""}
 未實現盈虧: {pos['unrealized_pnl']}
 槓桿倍數: {pos['leverage']}x
 標記價格: {pos['mark_price']}
@@ -1253,7 +1297,7 @@ def grid_v2_lab(client, passphrase, symbol):
             # client.futures_change_leverage(symbol=symbol, leverage=leverage)
             update_grid_positions_price(strategy, levels)
             batch_payloads = grid_v2_create_batch_payload(strategy=strategy, current_grid_index=5, mark_price=mark_price)
-            print(f'batch_payloads {batch_payloads}')
+            # print(f'batch_payloads {batch_payloads}')
             # 分批發送訂單
             for batch in batch_payloads:
                 logger.info(f"Sending batch order: {json.dumps(batch)}")
@@ -1400,26 +1444,34 @@ def create_order_execution(
         logger.error("錯誤詳情:", exc_info=True)
         raise
 
-def reduce_leverage(strategy: 'Strategy') -> None:
+def reduce_leverage(strategy: 'Strategy', side: str = 'LONG') -> None:
     """
     降低策略的槓桿率
     
     Args:
         strategy: Strategy 模型實例
+        side: 交易方向，預設為 'LONG'，可選 'LONG' 或 'SHORT'
     """
     try:
-        # 計算新的槓桿率
-        new_leverage_rate = float(strategy.leverage_rate) * float(strategy.reduce_rate)
-        
-        # 更新策略的槓桿率
-        strategy.leverage_rate = Decimal(str(new_leverage_rate))
+        if side == 'LONG':
+            # 計算多倉新的槓桿率
+            new_leverage_rate = float(strategy.leverage_rate) * float(strategy.reduce_rate)
+            # 更新策略的多倉槓桿率
+            strategy.leverage_rate = Decimal(str(new_leverage_rate))
+        else:
+            # 計算空倉新的槓桿率
+            new_leverage_rate = float(strategy.short_leverage_rate) * float(strategy.reduce_rate)
+            # 更新策略的空倉槓桿率
+            strategy.short_leverage_rate = Decimal(str(new_leverage_rate))
+            
         strategy.save()
         
         logger.info(f"""
 槓桿率調整:
 策略ID: {strategy.strategy_id}
 交易對: {strategy.symbol}
-調整後槓桿率: {strategy.leverage_rate}
+交易方向: {'多倉' if side == 'LONG' else '空倉'}
+調整後槓桿率: {new_leverage_rate}
 ------------------------""")
         
     except Exception as e:
@@ -1429,27 +1481,33 @@ def reduce_leverage(strategy: 'Strategy') -> None:
 
 def recover_leverage(strategy: 'Strategy') -> None:
     """
-    恢復策略的槓桿率,但不超過1
+    恢復策略的多空槓桿率,但不超過1
     
     Args:
         strategy: Strategy 模型實例
     """
     try:
-        # 計算新的槓桿率
-        new_leverage_rate = float(strategy.leverage_rate) * (1.0 + float(strategy.recover_rate))
-        
+        # 計算新的多倉槓桿率
+        new_long_leverage_rate = float(strategy.leverage_rate) * (1.0 + float(strategy.recover_rate))
         # 確保不超過上限1
-        new_leverage_rate = min(new_leverage_rate, 1.0)
+        new_long_leverage_rate = min(new_long_leverage_rate, 1.0)
         
-        # 更新策略的槓桿率
-        strategy.leverage_rate = Decimal(str(new_leverage_rate))
+        # 計算新的空倉槓桿率
+        new_short_leverage_rate = float(strategy.short_leverage_rate) * (1.0 + float(strategy.recover_rate))
+        # 確保不超過上限1
+        new_short_leverage_rate = min(new_short_leverage_rate, 1.0)
+        
+        # 更新策略的多空槓桿率
+        strategy.leverage_rate = Decimal(str(new_long_leverage_rate))
+        strategy.short_leverage_rate = Decimal(str(new_short_leverage_rate))
         strategy.save()
         
         logger.info(f"""
 槓桿率恢復:
 策略ID: {strategy.strategy_id}
 交易對: {strategy.symbol}
-調整後槓桿率: {strategy.leverage_rate}
+調整後多倉槓桿率: {strategy.leverage_rate}
+調整後空倉槓桿率: {strategy.short_leverage_rate}
 ------------------------""")
         
     except Exception as e:
@@ -1502,16 +1560,18 @@ def risk_control(client, symbol: str, close_order: dict) -> bool:
                 trade_group_id=trade_group_id+"_r",
                 thirdparty_id=response[0]['orderId'],
                 symbol=symbol,
-                side=close_order['side'],
-                type=close_order['type'],
+                trade_side=close_order['side'],
                 quantity=close_order['quantity'],
-                trade_type="RISK_CONTROL",  # 標記為風險控制交易
+                trade_type="RISK_CONTROL"  # 標記為風險控制交易
             )
             
             logger.info(f"風險控制平倉訂單執行成功: {response}")
             
-            # 降低槓桿率
-            reduce_leverage(strategy)
+            # 根據平倉方向決定要調整的槓桿率
+            # 當平倉方向為 SELL 時表示平掉多倉，所以要調整多倉槓桿率
+            # 當平倉方向為 BUY 時表示平掉空倉，所以要調整空倉槓桿率
+            leverage_side = 'LONG' if close_order['side'] == 'SELL' else 'SHORT'
+            reduce_leverage(strategy, leverage_side)
             return True
             
     except Exception as e:
@@ -1650,3 +1710,536 @@ def create_balance_history_snapshot():
             
     except Exception as e:
         logger.error(f"創建餘額歷史快照時發生錯誤: {str(e)}")
+
+def generate_grid_positions(strategy_id: int, grid_count: int) -> bool:
+    """
+    生成指定策略的網格倉位記錄
+    
+    Args:
+        strategy_id: 策略ID
+        grid_count: 網格數量
+        
+    Returns:
+        bool: 是否成功生成記錄
+    """
+    try:
+        # 獲取策略實例
+        strategy = Strategy.objects.get(strategy_id=strategy_id)
+        
+        # 檢查是否已存在網格倉位
+        existing_positions = GridPosition.objects.filter(strategy=strategy)
+        if existing_positions.exists():
+            logger.warning(f"策略 {strategy_id} 已存在網格倉位記錄")
+            return False
+            
+        # 準備批量創建的資料
+        positions_to_create = []
+        for i in range(grid_count):
+            positions_to_create.append(
+                GridPosition(
+                    strategy=strategy,
+                    grid_index=i,
+                    quantity=0,
+                    entry_price=0,
+                    exit_price=0,
+                    is_open=False,
+                    trade_group_id=''
+                )
+            )
+            
+        # 批量創建記錄
+        GridPosition.objects.bulk_create(positions_to_create)
+        
+        logger.info(f"成功為策略 {strategy_id} 生成 {grid_count} 筆網格倉位記錄")
+        return True
+        
+    except Strategy.DoesNotExist:
+        logger.error(f"找不到策略 {strategy_id}")
+        return False
+    except Exception as e:
+        logger.error(f"生成網格倉位記錄時發生錯誤: {str(e)}")
+        return False
+
+def get_all_future_open_order(client):
+    """
+    獲取所有合約的未完成掛單，以簡潔的單行格式顯示
+    
+    Args:
+        client: Binance client
+        
+    Returns:
+        list[dict]: 掛單摘要資訊列表，例如：
+            [
+                {
+                    'SOLUSDT': {
+                        'long_orders': 4,
+                        'short_orders': 5,
+                        'reduce_only_orders': 2,
+                        'total_orders': 11
+                    }
+                },
+                ...
+            ]
+    """
+    try:
+        # 獲取所有未完成的掛單
+        all_open_orders = client.futures_get_open_orders()
+        summary_list = []
+        
+        if not all_open_orders:
+            logger.info("目前沒有任何合約掛單")
+            return summary_list
+            
+        # 按幣種分組掛單
+        orders_by_symbol = {}
+        for order in all_open_orders:
+            symbol = order['symbol']
+            if symbol not in orders_by_symbol:
+                orders_by_symbol[symbol] = []
+            orders_by_symbol[symbol].append(order)
+            
+        logger.info("\n=== 合約掛單摘要 ===")
+        
+        for symbol, orders in orders_by_symbol.items():
+            logger.info(f"\n{symbol}:")
+            
+            # 統計變數初始化
+            long_orders = 0
+            short_orders = 0
+            reduce_only_orders = 0
+            
+            for order in orders:
+                # 格式化時間
+                order_time = datetime.fromtimestamp(order['time']/1000).strftime('%H:%M:%S')
+                
+                # 格式化價格資訊
+                price_info = order.get('price', 'N/A')
+                if order.get('stopPrice', 'N/A') != 'N/A':
+                    price_info = f"觸發價:{order['stopPrice']}"
+                
+                # 統計多空單和平倉單
+                if order['side'] == 'BUY':
+                    if not order['reduceOnly']:
+                        long_orders += 1
+                elif order['side'] == 'SELL':
+                    if not order['reduceOnly']:
+                        short_orders += 1
+                if order['reduceOnly']:
+                    reduce_only_orders += 1
+                
+                # 單行格式輸出
+                logger.info(
+                    f"[{order_time}] {order['type']} {order['side']} "
+                    f"數量:{order['origQty']} {price_info} "
+                    f"{'平倉' if order['reduceOnly'] else '開倉'} "
+                    f"ID:{order['orderId']}"
+                )
+            
+            # 印出該幣種的統計資訊
+            logger.info(
+                f"--- {symbol} 統計: "
+                f"多單:{long_orders}筆, "
+                f"空單:{short_orders}筆, "
+                f"平倉單:{reduce_only_orders}筆, "
+                f"總計:{len(orders)}筆 ---"
+            )
+            
+            # 將統計資訊加入摘要列表
+            summary_list.append({
+                symbol: {
+                    'long_orders': long_orders,
+                    'short_orders': short_orders,
+                    'reduce_only_orders': reduce_only_orders,
+                    'total_orders': len(orders)
+                }
+            })
+                
+        logger.info(f"\n總計掛單數量: {len(all_open_orders)}")
+        return summary_list
+        
+    except BinanceAPIException as e:
+        logger.error(f"獲取掛單資訊時發生 Binance API 錯誤: {str(e)}")
+        return []
+    except Exception as e:
+        logger.error(f"獲取掛單資訊時發生未預期錯誤: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+        return []
+
+def calculate_order_quantity(client, symbol, strategy):
+    """
+    計算訂單數量
+    
+    Args:
+        client: Binance client
+        symbol: 交易對符號
+        strategy: 策略實例
+        
+    Returns:
+        str: 格式化後的訂單數量
+    """
+    try:
+        balance = get_balance_by_symbol(symbol)
+        price = get_current_price(client, symbol)
+        mark_price = price['mark_price']
+        
+        quantity = get_grid_quantity(
+            symbol=symbol,
+            balance=balance,
+            leverage=strategy.leverage,
+            leverage_rate=strategy.leverage_rate,
+            mark_price=mark_price
+        )
+        
+        return quantity
+        
+    except Exception as e:
+        logger.error(f"計算訂單數量時發生錯誤: {str(e)}")
+        raise
+
+def grid_v2_lab_2(client, passphrase, symbol, price_step_rate=0.005, is_callback=False, executed_side=None, executed_price=None, is_reset=False, use_lock=True):
+    """
+    網格交易 2.0
+    
+    Args:
+        client: Binance client
+        passphrase: 策略密碼
+        symbol: 交易對符號
+        price_step_rate: 價格步長比率，預設 0.005 (0.5%)
+        is_callback: 是否為回調模式，預設 False
+        executed_side: 已執行的交易方向，預設 None
+        executed_price: 已執行的價格，預設 None
+        is_reset: 是否重置網格，預設 False
+        use_lock: 是否使用鎖，預設 True
+    """
+    # 如果使用鎖，則用 with 語句
+    if use_lock:
+        with _symbol_locks[symbol]:
+            return _grid_v2_lab_2_impl(
+                client, passphrase, symbol, price_step_rate,
+                is_callback, executed_side, executed_price, is_reset
+            )
+    # 如果不使用鎖，直接執行實作
+    else:
+        return _grid_v2_lab_2_impl(
+            client, passphrase, symbol, price_step_rate,
+            is_callback, executed_side, executed_price, is_reset
+        )
+
+def _grid_v2_lab_2_impl(client, passphrase, symbol, price_step_rate, is_callback, executed_side, executed_price, is_reset):
+    """實際的網格交易邏輯實作"""
+    try:
+        strategy = find_strategy_by_passphrase(passphrase)
+        balance = get_balance_by_symbol(symbol)
+        
+        # 根據目前持倉方向決定槓桿率
+        position_amount = float(balance.position_amount)
+        
+        # 使用 exchange_info_map 獲取交易對資訊
+        symbol_info = exchange_info_map.get(symbol)
+        if not symbol_info:
+            raise ValueError(f"找不到交易對資訊: {symbol}")
+        
+        # 獲取交易對資訊
+        tick_size = float(symbol_info['tickSize'])
+        price_precision = int(symbol_info['pricePrecision'])
+        quantity_precision = int(symbol_info['quantityPrecision'])
+        min_notional = float(symbol_info['minNotional'])
+
+        logger.info(f"""
+交易對資訊:
+Symbol: {symbol}
+Tick Size: {tick_size}
+Price Precision: {price_precision}
+Quantity Precision: {quantity_precision}
+Leverage: {strategy.leverage}
+Position Amount: {position_amount}
+------------------------""")
+                
+        # 如果是重置模式，先取消所有掛單
+        if is_reset:
+            try:
+                logger.info(f"重置模式：開始取消所有掛單 - Symbol: {symbol}")
+                client.futures_cancel_all_open_orders(symbol=symbol)
+                logger.info("已取消所有掛單")
+                current_orders = []
+            except Exception as e:
+                logger.error(f"取消掛單時發生錯誤: {str(e)}")
+                raise
+        else:
+            current_orders = client.futures_get_open_orders(symbol=symbol)
+        
+        # 如果沒有提供成交價格，則獲取當前市價
+        if executed_price is None:
+            current_price = get_current_price(client, symbol)
+            base_price = current_price['mark_price']
+        else:
+            base_price = float(executed_price)
+            
+        trade_group_id = generate_trade_group_id()
+
+        # 在計算數量時根據持倉方向和交易方向決定槓桿率
+        def get_order_quantity(side, price):
+            if position_amount < 0:  # 目前持空單
+                leverage_rate = float(strategy.short_leverage_rate if side == 'SELL' else 1.0)
+            else:  # 目前持多單或無倉位
+                leverage_rate = float(strategy.leverage_rate if side == 'BUY' else 1.0)
+            
+            return get_grid_quantity(
+                symbol=symbol,
+                balance=balance,
+                leverage=strategy.leverage,
+                leverage_rate=leverage_rate,
+                mark_price=price,
+                min_notional=min_notional
+            )
+
+        if not current_orders or is_reset:
+            logger.info(f"""
+開始建立完整網格:
+交易對: {symbol}
+基準價格: {base_price}
+價格間隔: {price_step_rate*100}%
+Tick Size: {tick_size}
+重置模式: {'是' if is_reset else '否'}
+------------------------""")
+            new_orders = []
+            
+            # 生成5個買單
+            for i in range(5):
+                raw_price = base_price * (1 - price_step_rate) ** (i + 1)
+                price = math.floor(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('BUY', price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_B{i+1}"
+                })
+            
+            # 生成5個賣單
+            for i in range(5):
+                raw_price = base_price * (1 + price_step_rate) ** (i + 1)
+                price = math.ceil(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('SELL', price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'SELL',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_S{i+1}"
+                })
+            
+            # 批次發送訂單（每次最多5個）
+            for i in range(0, len(new_orders), 5):
+                batch = new_orders[i:i+5]
+                try:
+                    response = client.futures_place_batch_order(
+                        batchOrders=json.dumps(batch)
+                    )
+                    logger.info(f"""
+批次下單結果 ({i//5 + 1}/2):
+訂單數量: {len(batch)}
+交易組ID: {trade_group_id}
+響應內容: {json.dumps(response, indent=2)}
+symbol: {batch[0]['symbol']}
+------------------------""")
+                except Exception as e:
+                    logger.error(f"批次下單失敗: {str(e)}")
+                    return
+
+        elif is_callback and executed_side:
+            # 處理訂單成交後的邏輯
+            buy_orders = [o for o in current_orders if o['side'] == 'BUY']
+            sell_orders = [o for o in current_orders if o['side'] == 'SELL']
+            new_orders = []
+            
+            if executed_side == 'BUY':
+                logger.info(f"處理買單成交後的邏輯 - 成交價格: {base_price}")
+                
+                # 1. 取消最遠的賣單
+                if sell_orders:
+                    furthest_sell = max(sell_orders, key=lambda x: float(x['price']))
+                    try:
+                        client.futures_cancel_order(
+                            symbol=symbol,
+                            orderId=furthest_sell['orderId']
+                        )
+                        logger.info(f"已取消最遠賣單，價格: {furthest_sell['price']}")
+                    except Exception as e:
+                        logger.error(f"取消賣單失敗: {str(e)}")
+                        return
+                
+                # 2. 準備新的賣單（比成交價高0.5%）
+                raw_price = base_price * (1 + price_step_rate)
+                new_near_sell_price = math.ceil(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('SELL', new_near_sell_price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'SELL',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, new_near_sell_price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_S1"
+                })
+                
+                # 3. 準備新的買單（比最低買單再低0.5%）
+                if buy_orders:
+                    lowest_buy = min(buy_orders, key=lambda x: float(x['price']))
+                    raw_price = float(lowest_buy['price']) * (1 - price_step_rate)
+                else:
+                    raw_price = base_price * (1 - price_step_rate * 5)
+                    
+                new_far_buy_price = math.floor(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('BUY', new_far_buy_price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, new_far_buy_price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_B5"
+                })
+                
+            elif executed_side == 'SELL':
+                logger.info("處理賣單成交後的邏輯")
+                
+                # 1. 取消最遠的買單
+                if buy_orders:
+                    furthest_buy = min(buy_orders, key=lambda x: float(x['price']))
+                    try:
+                        client.futures_cancel_order(
+                            symbol=symbol,
+                            orderId=furthest_buy['orderId']
+                        )
+                        logger.info(f"已取消最遠買單，價格: {furthest_buy['price']}")
+                    except Exception as e:
+                        logger.error(f"取消買單失敗: {str(e)}")
+                        return
+                
+                # 2. 準備新的買單（比成交價低0.5%）
+                raw_price = base_price * (1 - price_step_rate)
+                new_near_buy_price = math.floor(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('BUY', new_near_buy_price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, new_near_buy_price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_B1"
+                })
+                
+                # 3. 準備新的賣單（比最高賣單再高0.5%）
+                if sell_orders:
+                    highest_sell = max(sell_orders, key=lambda x: float(x['price']))
+                    raw_price = float(highest_sell['price']) * (1 + price_step_rate)
+                else:
+                    raw_price = base_price * (1 + price_step_rate * 5)
+                    
+                new_far_sell_price = math.ceil(raw_price / tick_size) * tick_size
+                quantity = get_order_quantity('SELL', new_far_sell_price)
+                new_orders.append({
+                    'symbol': symbol,
+                    'side': 'SELL',
+                    'type': 'LIMIT',
+                    'timeInForce': 'GTC',
+                    'price': format_decimal_symbol_price(symbol, new_far_sell_price),
+                    'quantity': quantity,
+                    'newClientOrderId': f"{trade_group_id}_S5"
+                })
+            
+            # 批次下新單
+            if new_orders:
+                try:
+                    response = client.futures_place_batch_order(
+                        batchOrders=json.dumps(new_orders)
+                    )
+                    logger.info(f"""
+批次下單結果:
+訂單數量: {len(new_orders)}
+交易組ID: {trade_group_id}
+響應內容: {json.dumps(response, indent=2)}
+------------------------""")
+                except Exception as e:
+                    logger.error(f"批次下單失敗: {str(e)}")
+                    return
+
+    except Exception as e:
+        logger.error(f"網格交易實驗 2.0 執行失敗 - Symbol: {symbol}, Error: {str(e)}")
+        logger.error("錯誤詳情:", exc_info=True)
+        raise
+
+def check_and_reset_grid_orders(client, symbol):
+    """
+    檢查並重置網格掛單
+    
+    Args:
+        client: Binance client
+        symbol: 交易對符號
+        
+    Returns:
+        bool: 是否成功執行
+    """
+    try:
+        # 嘗試獲取鎖，如果無法立即獲取則返回
+        if not _symbol_locks[symbol].acquire(blocking=False):
+            logger.info(f"{symbol} 正在執行其他操作，跳過檢查")
+            return False
+            
+        try:
+            current_orders = client.futures_get_open_orders(symbol=symbol)
+            
+            if len(current_orders) != 10:
+                logger.info(f"檢測到 {symbol} 掛單數量錯誤 ({len(current_orders)}/10)，執行重置")
+                
+                # 查找對應的策略
+                strategy = get_strategy_by_symbol(symbol)
+                logger.info(strategy)
+                if strategy:
+                    grid_v2_lab_2(
+                        client=client,
+                        passphrase=strategy.passphrase,
+                        symbol=symbol,
+                        is_reset=True,
+                        use_lock=False
+                    )
+                    return True
+                else:
+                    logger.error(f"找不到 {symbol} 對應的策略")
+                    return False
+                    
+            return True
+            
+        finally:
+            _symbol_locks[symbol].release()
+            
+    except Exception as e:
+        logger.error(f"檢查 {symbol} 網格掛單時發生錯誤: {str(e)}")
+        return False
+
+def get_active_grid_v2_symbols() -> list:
+    """
+    獲取所有狀態為 ACTIVE 且策略類型為 grid_v2 的交易對符號
+    
+    Returns:
+        list: 符合條件的交易對符號列表，例如 ['BTCUSDT', 'ETHUSDT']
+    """
+    try:
+        symbols = Strategy.objects.filter(
+            strategy_type='grid_v2',
+            status='ACTIVE'
+        ).values_list('symbol', flat=True)
+        
+        return list(symbols)
+        
+    except Exception as e:
+        logger.error(f"獲取ACTIVE grid_v2 交易對時發生錯誤: {str(e)}")
+        return []

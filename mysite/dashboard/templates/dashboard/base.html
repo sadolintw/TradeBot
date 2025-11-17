@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Trading Dashboard</title>
+    <style>
+        .login-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .google-login-btn {
+            display: inline-block;
+            background: #4285f4;
+            color: white;
+            padding: 10px 20px;
+            text-decoration: none;
+            border-radius: 5px;
+        }
+        .header {
+            padding: 10px;
+            background: #f8f9fa;
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+    {% if user.is_authenticated %}
+    <div class="header">
+        <span>{{ user.email }}</span>
+        <a href="{% url 'dashboard:logout' %}">登出</a>
+    </div>
+    {% endif %}
+    
+    {% block content %}
+    {% endblock %}
+</body>
+</html> 

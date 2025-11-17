@@ -1,0 +1,132 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="container">
+    <h1>交易狀態</h1>
+    
+    {% if account_info %}
+    <div class="account-info">
+        <h2>帳戶資訊</h2>
+        <p>帳戶名稱: {{ account_info.account_name }}</p>
+        <p>更新時間: {{ account_info.updated_at }}</p>
+    </div>
+    {% endif %}
+    
+    {% if open_orders %}
+        <div class="orders-summary">
+            <h2>當前掛單</h2>
+            {% for symbol, info in open_orders.items %}
+                <div class="order-item">
+                    <h3>{{ symbol }}</h3>
+                    <ul>
+                        <li>多單: {{ info.long_orders }}</li>
+                        <li>空單: {{ info.short_orders }}</li>
+                        <li>平倉單: {{ info.reduce_only_orders }}</li>
+                        <li>總計: {{ info.total_orders }}</li>
+                    </ul>
+                    <button class="grid-btn" onclick="executeGridV2('{{ symbol }}')">
+                        執行 Grid V2
+                    </button>
+                </div>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p>目前沒有未完成的掛單</p>
+    {% endif %}
+</div>
+
+<style>
+    .container {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+    
+    .account-info {
+        background: #f8f9fa;
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
+    
+    .orders-summary {
+        margin-top: 20px;
+    }
+    
+    .order-item {
+        background: white;
+        padding: 20px;
+        margin-bottom: 15px;
+        border-radius: 6px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .order-item h3 {
+        margin-top: 0;
+        color: #4285f4;
+    }
+    
+    .order-item ul {
+        list-style: none;
+        padding: 0;
+    }
+    
+    .order-item li {
+        margin: 5px 0;
+    }
+
+    .grid-btn {
+        margin-top: 10px;
+        padding: 8px 16px;
+        background: #28a745;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+
+    .grid-btn:hover {
+        background: #218838;
+    }
+</style>
+
+<script>
+function executeGridV2(symbol) {
+    if (confirm(`確定要對 ${symbol} 執行 Grid V2 ?`)) {
+        fetch(`/dashboard/execute-grid-v2/${symbol}/`, {
+            method: 'POST',
+            headers: {
+                'X-CSRFToken': getCookie('csrftoken')
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert(`${symbol} 已掛單`);
+                location.reload();  // 重新載入頁面以更新狀態
+            } else {
+                alert(`錯誤: ${data.error}`);
+            }
+        })
+        .catch(error => {
+            alert(`執行失敗: ${error}`);
+        });
+    }
+}
+
+function getCookie(name) {
+    let cookieValue = null;
+    if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+        }
+    }
+    return cookieValue;
+}
+</script>
+{% endblock %} 

@@ -1,0 +1,12 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="login-container">
+    <h2>Trading Dashboard 登入</h2>
+    <div class="social-login">
+        <a href="{% url 'dashboard:social:begin' 'google-oauth2' %}" class="google-login-btn">
+            使用 Google 帳號登入
+        </a>
+    </div>
+</div>
+{% endblock %} 

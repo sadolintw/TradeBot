@@ -27,7 +27,7 @@ SECRET_KEY = os.environ['SECRET_KEY']
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ["trade.sadolintw.app", "122.116.140.186", "localhost"]
+ALLOWED_HOSTS = ["trade.sadolintw.app", "122.116.140.186", "localhost", "127.0.0.1", "172.21.208.1", "192.168.2.159"]
 
 # Application definition
 
@@ -41,6 +41,8 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'trade',
+    'social_django',
+    'dashboard',
     # 'python-telegram-bot'
 ]
 
@@ -53,6 +55,8 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'social_django.middleware.SocialAuthExceptionMiddleware',
+    'mysite.settings.SSLRedirectMiddleware',
 ]
 
 ROOT_URLCONF = 'mysite.urls'
@@ -68,6 +72,8 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
+                'social_django.context_processors.backends',
+                'social_django.context_processors.login_redirect',
             ],
         },
     },
@@ -150,3 +156,64 @@ CORS_ALLOW_METHODS = [
     'POST',
     # 'PUT',
 ]
+
+AUTHENTICATION_BACKENDS = (
+    'social_core.backends.google.GoogleOAuth2',
+    'django.contrib.auth.backends.ModelBackend',
+)
+
+# Google OAuth2 設定
+SOCIAL_AUTH_GOOGLE_OAUTH2_KEY = os.environ.get('GOOGLE_OAUTH2_KEY')  # Google Client ID
+SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = os.environ.get('GOOGLE_OAUTH2_SECRET')  # Google Client Secret
+
+SOCIAL_AUTH_PIPELINE = (
+    'social_core.pipeline.social_auth.social_details',
+    'social_core.pipeline.social_auth.social_uid',
+    'social_core.pipeline.social_auth.auth_allowed',
+    'social_core.pipeline.social_auth.social_user',
+    'social_core.pipeline.user.get_username',
+    'social_core.pipeline.user.create_user',
+    'social_core.pipeline.social_auth.associate_user',
+    'social_core.pipeline.social_auth.load_extra_data',
+    'social_core.pipeline.user.user_details',
+)
+
+# 額外的 social auth 設定
+SOCIAL_AUTH_GOOGLE_OAUTH2_SCOPE = [
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+]
+
+# 登入相關 URL
+LOGIN_URL = 'dashboard:login'
+LOGIN_REDIRECT_URL = 'dashboard:index'
+LOGOUT_URL = 'dashboard:logout'
+LOGOUT_REDIRECT_URL = 'dashboard:login'
+
+# 社交認證設定
+SOCIAL_AUTH_URL_NAMESPACE = 'dashboard:social'
+
+# CSRF 設定
+CSRF_TRUSTED_ORIGINS = [
+    'https://trade.sadolintw.app',
+    'http://trade.sadolintw.app',
+    'http://122.116.140.186',
+    'http://localhost:8000',
+]
+
+# 社交認證設定
+SOCIAL_AUTH_REDIRECT_IS_HTTPS = True
+
+# 確保使用 HTTPS，但只針對特定路徑
+SECURE_SSL_REDIRECT = False
+
+# 添加中間件來處理特定路徑的 HTTPS 重定向
+class SSLRedirectMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.path.startswith('/dashboard/'):
+            request.is_secure = lambda: True
+        return self.get_response(request)
+

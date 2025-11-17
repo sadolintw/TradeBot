@@ -1,0 +1,9 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="container">
+    <h1>發生錯誤</h1>
+    <p>{{ error }}</p>
+    <a href="{% url 'dashboard:login' %}">返回登入頁面</a>
+</div>
+{% endblock %} 

@@ -1,0 +1,71 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="container">
+    <h1>Trading Dashboard</h1>
+    {% if user.is_authenticated %}
+        <p>歡迎回來, {{ user.email }}!</p>
+        
+        {% if is_superuser %}
+            <div class="admin-features">
+                <h2>管理員功能</h2>
+                <div class="feature-grid">
+                    <div class="feature-item">
+                        <h3>交易狀態</h3>
+                        <p>查看當前所有倉位和訂單</p>
+                        <a href="{% url 'dashboard:trading_status' %}" class="feature-btn">查看詳情</a>
+                    </div>
+                    <div class="feature-item">
+                        <h3>系統設定</h3>
+                        <p>管理交易策略和參數</p>
+                        <a href="#" class="feature-btn">進入設定</a>
+                    </div>
+                </div>
+            </div>
+        {% endif %}
+    {% endif %}
+</div>
+
+<style>
+    .container {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+    
+    .admin-features {
+        margin-top: 30px;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 8px;
+    }
+    
+    .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 20px;
+        margin-top: 20px;
+    }
+    
+    .feature-item {
+        padding: 20px;
+        background: white;
+        border-radius: 6px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .feature-btn {
+        display: inline-block;
+        padding: 8px 16px;
+        background: #4285f4;
+        color: white;
+        text-decoration: none;
+        border-radius: 4px;
+        margin-top: 10px;
+    }
+    
+    .feature-btn:hover {
+        background: #3367d6;
+    }
+</style>
+{% endblock %} 

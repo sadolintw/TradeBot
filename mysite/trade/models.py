@@ -39,6 +39,9 @@ class Strategy(models.Model):
     reduce_rate = models.DecimalField(max_digits=10, decimal_places=2)
     hold_rate = models.DecimalField(max_digits=10, decimal_places=2)
     recover_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    hold_reduce_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    short_hold_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    short_leverage_rate = models.DecimalField(max_digits=10, decimal_places=2)
 
     class Meta:
         db_table = 'strategies'
@@ -87,7 +90,7 @@ class AccountBalance(models.Model):
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
     balance = models.DecimalField(max_digits=20, decimal_places=8)
     equity = models.DecimalField(max_digits=10, decimal_places=2)
-    available_margin = models.DecimalField(max_digits=10, decimal_places=2)
+    available_margin = models.DecimalField(max_digits=20, decimal_places=8)
     used_margin = models.DecimalField(max_digits=20, decimal_places=8, default=0)
     unrealized_pnl = models.DecimalField(max_digits=20, decimal_places=8, default=0)
     position_value = models.DecimalField(max_digits=20, decimal_places=8, default=0)
@@ -102,8 +105,7 @@ class AccountBalance(models.Model):
     def __str__(self):
         return (f"Balance ID: {self.balance_id}, Strategy ID: {self.strategy_id}, Balance: {self.balance}, "
                 f"Equity: {self.equity}, Available Margin: {self.available_margin}, Used Margin: {self.used_margin}, "
-                f"Profit/Loss: {self.profit_loss}, Timestamp: {self.timestamp}, "
-                f"Created At: {self.created_at}, Updated At: {self.updated_at}")
+                f"Profit/Loss: {self.profit_loss}, Created At: {self.created_at}, Updated At: {self.updated_at}")
 
 
 class GridPosition(models.Model):
